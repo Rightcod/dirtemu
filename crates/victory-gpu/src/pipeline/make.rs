@@ -320,25 +320,18 @@ fn parse_workers(value: &str) -> Option<usize> {
         .filter(|&n| (1..=WORKERS_OVERRIDE_MAX).contains(&n))
 }
 
-/// At most this many logical processors: the machines small enough that a pipeline worker
-/// sitting on every physical core starves the title's own threads.
-const WORKERS_SMALL: usize = 8;
-
 /// How many workers to start, given the logical processors the process may run on and its
-/// physical cores when known. Half the logical processors, as before. On a small SMT machine
-/// one physical core is left to the title's own threads (recording, loading): six recording
-/// threads beside four pipeline workers on a 4C/8T Xeon put nine runnable threads on eight
-/// logical processors, and the workers run below normal priority. Machines of twelve logical
-/// processors or more keep their halves (six, eight, or the cap) as before.
+/// physical cores when known. Default is half the logical processors clamped to 2..=8.
+/// On machines with four or fewer physical cores, do not exceed the physical core count.
 fn worker_count(logical: usize, physical: Option<usize>) -> usize {
     let logical = logical.max(1);
-    let halves = (logical / 2).clamp(WORKERS_MIN, WORKERS_MAX);
-    match physical {
-        Some(physical) if logical <= WORKERS_SMALL && physical < logical => {
-            halves.min(physical.saturating_sub(1).clamp(WORKERS_MIN, WORKERS_MAX))
-        }
-        _ => halves,
+    let mut workers = (logical / 2).clamp(WORKERS_MIN, WORKERS_MAX);
+    if let Some(physical) = physical.filter(|&p| p > 0)
+        && physical <= 4
+    {
+        workers = workers.min(physical);
     }
+    workers
 }
 
 /// The machine's physical cores, across processor groups; `None` if Windows cannot say.
@@ -496,22 +489,22 @@ mod tests {
         assert!(super::super::library::wanted_early(&p.key));
     }
 
-    /// A 4C/8T machine gets three workers instead of four; twelve threads or more keep the
-    /// old counts, so 16 threads still get eight.
+    /// Default is clamp(logical/2,2,8); machines with <=4 physical cores do not exceed
+    /// physical cores. An explicit override is parsed separately and used as-is by workers().
     #[test]
-    fn worker_counts_leave_one_physical_core_to_the_title() {
-        assert_eq!(worker_count(8, Some(4)), 3);
+    fn worker_counts_follow_cpu_policy() {
+        assert_eq!(worker_count(8, Some(4)), 4);
+        assert_eq!(worker_count(16, Some(4)), 4);
+        assert_eq!(worker_count(4, Some(2)), 2);
+        assert_eq!(worker_count(8, Some(2)), 2);
         assert_eq!(worker_count(12, Some(6)), 6);
         assert_eq!(worker_count(16, Some(8)), 8);
         assert_eq!(worker_count(32, Some(16)), 8);
-        // No SMT (or no answer from Windows): as before.
         assert_eq!(worker_count(4, Some(4)), 2);
         assert_eq!(worker_count(8, None), 4);
         assert_eq!(worker_count(16, None), 8);
-        // Tiny machines still start two; they cannot start fewer than before either.
-        assert_eq!(worker_count(1, Some(1)), 2);
+        assert_eq!(worker_count(1, Some(1)), 1);
         assert_eq!(worker_count(2, Some(2)), 2);
-        assert_eq!(worker_count(2, Some(1)), 2);
     }
 
     /// The worker override takes one to 64 and rejects everything else.

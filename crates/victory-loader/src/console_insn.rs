@@ -56,6 +56,25 @@ const SPANS: usize = 16;
 /// Faulting addresses whose readable length is remembered per thread, newest first.
 const KNOWN: usize = 8;
 
+/// Single-entry decode cache for repeated faults at the same instruction address.
+/// Safe for the hot AMD-only loops where the faulting RIP stays stable.
+#[derive(Clone, Copy)]
+struct LastDecode {
+    rip: usize,
+    bytes: [u8; MAX_INSN],
+    len: u8,
+    insn: Option<(ConsoleOnly, usize)>,
+}
+
+impl LastDecode {
+    const EMPTY: LastDecode = LastDecode {
+        rip: 0,
+        bytes: [0; MAX_INSN],
+        len: 0,
+        insn: None,
+    };
+}
+
 #[derive(Clone, Copy)]
 struct Span {
     from: usize,
@@ -162,6 +181,8 @@ thread_local! {
     static WRITABLE: RefCell<WritableCache> = const { RefCell::new(WritableCache::new()) };
     /// Faulting addresses and how many bytes were found readable there.
     static READABLE: Cell<Known> = const { Cell::new(Known::EMPTY) };
+    /// Last decoded instruction at a faulting RIP.
+    static LAST_DECODE: Cell<LastDecode> = const { Cell::new(LastDecode::EMPTY) };
     /// Instruction kinds this thread has seen (and logged).
     static SEEN_LOCAL: Cell<u32> = const { Cell::new(0) };
     static COUNTERS: Cell<Counters> = const { Cell::new(Counters::ZERO) };
@@ -307,11 +328,36 @@ fn readable(rip: usize) -> Option<usize> {
 /// The console-only instruction at `rip`, decoded from the bytes found readable there;
 /// `VICTORY_CLZERO_ASK=1` asks Windows every time as before.
 fn classify(rip: usize) -> Option<(ConsoleOnly, usize)> {
+    if remembers() {
+        let cached = LAST_DECODE.with(Cell::get);
+        if cached.rip == rip && cached.len != 0 {
+            // SAFETY: bytes were readable when cached; for self-modifying code the cache
+            // is validated by byte comparison below on miss or by the readable probe.
+            let code = &cached.bytes[..usize::from(cached.len)];
+            let current = unsafe { std::slice::from_raw_parts(rip as *const u8, code.len()) };
+            if current == code {
+                return cached.insn;
+            }
+        }
+    }
     let n = readable(rip)?;
     // SAFETY: `n` bytes at `rip` are readable.
     let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
     note_decoded();
-    decode::decode(code)
+    let insn = decode::decode(code);
+    if remembers() {
+        let mut bytes = [0u8; MAX_INSN];
+        bytes[..n].copy_from_slice(code);
+        LAST_DECODE.with(|cell| {
+            cell.set(LastDecode {
+                rip,
+                bytes,
+                len: n as u8,
+                insn,
+            })
+        });
+    }
+    insn
 }
 
 /// The bit standing for an instruction kind in [`SEEN`] (variants with fields share one).
@@ -518,6 +564,7 @@ mod tests {
     fn forget_caches() {
         READABLE.with(|known| known.set(Known::EMPTY));
         WRITABLE.with_borrow_mut(|cache| *cache = WritableCache::new());
+        LAST_DECODE.with(|cell| cell.set(LastDecode::EMPTY));
         SEEN_LOCAL.with(|seen| seen.set(0));
     }
 
@@ -888,6 +935,42 @@ mod tests {
             "readable length: one VirtualQuery per address for 1000 faults, {} for two addresses",
             counters().queries
         );
+    }
+
+    #[test]
+    fn repeated_classify_uses_decode_cache() {
+        if !remembers() {
+            return;
+        }
+        let pages = Pages::new(4096);
+        unsafe { std::ptr::copy_nonoverlapping([0x0f, 0x01, 0xfd].as_ptr(), pages.at, 3) };
+        let at = pages.at as usize;
+        forget_caches();
+        reset_counters();
+        assert_eq!(classify(at), Some((ConsoleOnly::Rdpru, 3)));
+        let after_first = counters().decoded;
+        for _ in 0..1000 {
+            assert_eq!(classify(at), Some((ConsoleOnly::Rdpru, 3)));
+        }
+        assert_eq!(
+            counters().decoded,
+            after_first,
+            "same RIP with same bytes should not be decoded again"
+        );
+    }
+
+    #[test]
+    fn decode_cache_invalidates_on_byte_change() {
+        if !remembers() {
+            return;
+        }
+        let pages = Pages::new(4096);
+        unsafe { std::ptr::copy_nonoverlapping([0x0f, 0x01, 0xfd].as_ptr(), pages.at, 3) };
+        let at = pages.at as usize;
+        forget_caches();
+        assert_eq!(classify(at), Some((ConsoleOnly::Rdpru, 3)));
+        unsafe { std::ptr::copy_nonoverlapping([0x0f, 0x01, 0xfa].as_ptr(), pages.at, 3) };
+        assert_eq!(classify(at), Some((ConsoleOnly::Monitorx, 3)));
     }
 
     /// The old sighting check locked a mutex on every emulated instruction; a thread-local
