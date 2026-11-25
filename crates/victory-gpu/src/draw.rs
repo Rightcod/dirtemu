@@ -1946,12 +1946,6 @@ impl State {
         }
     }
 
-    /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
-    /// programs are one-dimensional).
-    pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.dispatch_mesh_groups(list, x, 1, 1);
-    }
-
     pub(crate) fn dispatch_mesh_groups(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         self.window = None;
         if x == 0 {

@@ -263,7 +263,7 @@ pub(crate) fn bc3_host(desc: &ResourceDesc, unaligned: bool) -> Bc3Host {
         return Bc3Host::Native;
     }
     let needs_fallback = desc.dimension == TEXTURE_1D
-        || (!unaligned && (desc.width % 4 != 0 || u64::from(desc.height) % 4 != 0));
+        || (!unaligned && (!desc.width.is_multiple_of(4) || !u64::from(desc.height).is_multiple_of(4)));
     if !needs_fallback {
         return Bc3Host::Native;
     }
