@@ -34,6 +34,7 @@ enum TypeDef {
     Ptr(Ty, u32),
     Struct(Option<String>, Vec<Ty>),
     Array(u32, Ty),
+    Vector(u32, Ty),
     Func(Ty, Vec<Ty>),
 }
 
@@ -255,6 +256,9 @@ impl Module {
     }
     pub fn array(&mut self, n: u32, of: Ty) -> Ty {
         self.ty(TypeDef::Array(n, of))
+    }
+    pub fn vector(&mut self, n: u32, of: Ty) -> Ty {
+        self.ty(TypeDef::Vector(n, of))
     }
     pub fn named_struct(&mut self, name: &str, fields: Vec<Ty>) -> Ty {
         self.ty(TypeDef::Struct(Some(name.into()), fields))
@@ -581,6 +585,7 @@ impl Module {
                 TypeDef::Int(b) => w.record(7, &[u64::from(*b)]),
                 TypeDef::Ptr(p, space) => w.record(8, &[u64::from(p.0), u64::from(*space)]),
                 TypeDef::Array(n, e) => w.record(11, &[u64::from(*n), u64::from(e.0)]),
+                TypeDef::Vector(n, e) => w.record(12, &[u64::from(*n), u64::from(e.0)]),
                 TypeDef::Struct(name, fields) => {
                     let mut r = vec![0];
                     r.extend(fields.iter().map(|f| u64::from(f.0)));

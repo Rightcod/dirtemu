@@ -15,6 +15,8 @@ use crate::dxbc::{Container, FourCC};
 
 pub struct Host {
     pub device: ID3D12Device,
+    profile: super::ShaderProfile,
+    highest_shader_model: u32,
 }
 
 /// What the stage declares that a pipeline must match.
@@ -62,6 +64,12 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// Whether the tests also run the WARP adapter (`VICTORY_WARP=0` off).
+#[cfg(test)]
+pub fn warp_enabled() -> bool {
+    std::env::var("VICTORY_WARP").map_or(true, |v| v != "0")
+}
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
@@ -94,9 +102,11 @@ impl Host {
                 if let Some(made) = &device {
                     let factory: IDXGIFactory4 =
                         CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                    if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
+                    if let Ok(adapter) =
+                        factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
                         && let Ok(desc) = adapter.GetDesc1()
-                        && (desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
+                        && (desc.Flags & 2 != 0
+                            || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
                     {
                         return Err("the default device is the software adapter".to_owned());
                     }
@@ -113,13 +123,59 @@ impl Host {
                     size_of_val(&sm) as u32,
                 )
                 .map_err(err)?;
-            if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
-                return Err(format!(
-                    "the device supports SM {:#x} only",
-                    sm.HighestShaderModel.0
-                ));
-            }
-            Ok(Host { device })
+            let highest = sm.HighestShaderModel.0 as u32;
+            let request = super::profile::current_request()?;
+            let profile = match request {
+                // Offline and the test host stay on SM 6.6: the runtime
+                // calls `set_host_shader_model` at device creation to make
+                // `auto` follow the adapter.
+                super::ShaderProfileRequest::Auto | super::ShaderProfileRequest::Sm66 => {
+                    if highest < D3D_SHADER_MODEL_6_6.0 as u32 {
+                        return Err(format!("the device supports SM {highest:#x} only"));
+                    }
+                    super::ShaderProfile::Sm66
+                }
+                super::ShaderProfileRequest::Sm65 => {
+                    if highest < D3D_SHADER_MODEL_6_5.0 as u32 {
+                        return Err(format!("the device supports SM {highest:#x} only"));
+                    }
+                    super::ShaderProfile::Sm65
+                }
+            };
+            Ok(Host {
+                device,
+                profile,
+                highest_shader_model: highest,
+            })
+        }
+    }
+
+    /// The shader model this host's pipelines are built for.
+    pub fn profile(&self) -> super::ShaderProfile {
+        self.profile
+    }
+
+    /// The adapter's highest shader model (`D3D_SHADER_MODEL` value).
+    pub fn highest_shader_model(&self) -> u32 {
+        self.highest_shader_model
+    }
+
+    /// Whether the device can create SM 6.6 pipelines.
+    pub fn has_sm66(&self) -> bool {
+        self.highest_shader_model >= D3D_SHADER_MODEL_6_6.0 as u32
+    }
+
+    /// Whether this host's profile is the shader's (a pipeline built from a
+    /// translation for another profile is refused by the device).
+    pub fn accepts(&self, shader: &HostShader) -> Result<(), String> {
+        if shader.profile == self.profile {
+            Ok(())
+        } else {
+            Err(format!(
+                "the shader is {} but this device is {}",
+                shader.profile.cache_key(),
+                self.profile.cache_key()
+            ))
         }
     }
 
@@ -131,18 +187,99 @@ impl Host {
         vs: &HostShader,
         ps: &HostShader,
     ) -> Result<ID3D12RootSignature, String> {
+        self.accepts(vs)?;
+        self.accepts(ps)?;
         self.root_signature_for(&[
             (vs, D3D12_SHADER_VISIBILITY_VERTEX),
             (ps, D3D12_SHADER_VISIBILITY_PIXEL),
         ])
     }
 
+    /// The root views and dynamic-heap aliases these stages declare, in
+    /// root-parameter order (deduplicated across stages).
+    fn root_layout(
+        stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
+    ) -> (Vec<(u8, u8)>, Vec<super::shader::DescriptorAlias>) {
+        // By slot, then kind: 0 CBV, 1 SRV, 2 UAV.
+        let mut views: Vec<(u8, u8)> = stages
+            .iter()
+            .flat_map(|(s, _)| {
+                let cbvs = s.root_cbvs.iter().map(|&r| (r, 0));
+                let srvs = s.root_srvs.iter().map(|&r| (r, 1));
+                cbvs.chain(srvs).chain(s.root_uavs.iter().map(|&r| (r, 2)))
+            })
+            .collect();
+        views.sort_unstable();
+        views.dedup();
+        let mut aliases = Vec::new();
+        for (s, _) in stages {
+            for a in &s.descriptor_aliases {
+                if !aliases.contains(a) {
+                    aliases.push(*a);
+                }
+            }
+        }
+        (views, aliases)
+    }
+
+    /// The root parameters of the dynamic-heap aliases: each is bound to
+    /// the base of its heap (`true` for the sampler heap).
+    pub fn alias_parameters(
+        &self,
+        stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
+    ) -> Vec<(u32, bool)> {
+        let (views, aliases) = Self::root_layout(stages);
+        let base = stages.len() + views.len();
+        aliases
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                (
+                    (base + i) as u32,
+                    a.class == super::shader::DescriptorClass::Sampler,
+                )
+            })
+            .collect()
+    }
+
+    /// [`alias_parameters`](Self::alias_parameters) for a compute stage.
+    pub fn compute_alias_parameters(&self, cs: &HostShader) -> Vec<(u32, bool)> {
+        self.alias_parameters(&[(cs, D3D12_SHADER_VISIBILITY_ALL)])
+    }
+
+    /// [`alias_parameters`](Self::alias_parameters) for a vertex and pixel
+    /// stage.
+    pub fn graphics_alias_parameters(&self, vs: &HostShader, ps: &HostShader) -> Vec<(u32, bool)> {
+        self.alias_parameters(&[
+            (vs, D3D12_SHADER_VISIBILITY_VERTEX),
+            (ps, D3D12_SHADER_VISIBILITY_PIXEL),
+        ])
+    }
+
     /// The root signature for these stages: user data of stage k is root
-    /// parameter k, root views follow.
+    /// parameter k, root views follow, then one descriptor-table alias per
+    /// SM 6.5 dynamic-heap range (the host binds it to the heap's base).
     pub fn root_signature_for(
         &self,
         stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
     ) -> Result<ID3D12RootSignature, String> {
+        let (views, aliases) = Self::root_layout(stages);
+        let ranges: Vec<D3D12_DESCRIPTOR_RANGE1> = aliases
+            .iter()
+            .map(|a| D3D12_DESCRIPTOR_RANGE1 {
+                RangeType: match a.class {
+                    super::shader::DescriptorClass::Srv => D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                    super::shader::DescriptorClass::Uav => D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                    super::shader::DescriptorClass::Cbv => D3D12_DESCRIPTOR_RANGE_TYPE_CBV,
+                    super::shader::DescriptorClass::Sampler => D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,
+                },
+                NumDescriptors: u32::MAX,
+                BaseShaderRegister: 0,
+                RegisterSpace: a.space,
+                Flags: D3D12_DESCRIPTOR_RANGE_FLAG_NONE,
+                OffsetInDescriptorsFromTableStart: 0,
+            })
+            .collect();
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = stages
             .iter()
             .map(|&(s, vis)| D3D12_ROOT_PARAMETER1 {
@@ -157,17 +294,6 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        // By slot, then kind: 0 CBV, 1 SRV, 2 UAV.
-        let mut views: Vec<(u8, u8)> = stages
-            .iter()
-            .flat_map(|(s, _)| {
-                let cbvs = s.root_cbvs.iter().map(|&r| (r, 0));
-                let srvs = s.root_srvs.iter().map(|&r| (r, 1));
-                cbvs.chain(srvs).chain(s.root_uavs.iter().map(|&r| (r, 2)))
-            })
-            .collect();
-        views.sort_unstable();
-        views.dedup();
         for (slot, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: match kind {
@@ -180,6 +306,18 @@ impl Host {
                         ShaderRegister: u32::from(slot),
                         RegisterSpace: super::ROOT_CBV_SPACE,
                         Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
+        for (i, _) in aliases.iter().enumerate() {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                        NumDescriptorRanges: 1,
+                        pDescriptorRanges: unsafe { ranges.as_ptr().add(i) },
                     },
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
@@ -206,6 +344,12 @@ impl Host {
                 });
             }
         }
+        let direct_heap = stages.iter().any(|(s, _)| s.direct_heap);
+        let mut flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        if direct_heap {
+            flags |= D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+                | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+        }
         let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
             Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
             Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
@@ -214,9 +358,7 @@ impl Host {
                     pParameters: params.as_ptr(),
                     NumStaticSamplers: samplers.len() as u32,
                     pStaticSamplers: samplers.as_ptr(),
-                    Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
-                        | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                        | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                    Flags: flags,
                 },
             },
         };
@@ -240,6 +382,7 @@ impl Host {
         &self,
         cs: &HostShader,
     ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+        self.accepts(cs)?;
         let root = self.root_signature_for(&[(cs, D3D12_SHADER_VISIBILITY_ALL)])?;
         let pso = self.compute_pipeline_with(&root, &cs.dxil)?;
         Ok((root, pso))
@@ -280,7 +423,10 @@ impl Host {
                 let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
                 if queue.GetMessage(i, Some(message), &mut len).is_ok() {
                     let m = &*message;
-                    let bytes = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength.saturating_sub(1));
+                    let bytes = std::slice::from_raw_parts(
+                        m.pDescription,
+                        m.DescriptionByteLength.saturating_sub(1),
+                    );
                     text.push_str(" | ");
                     text.push_str(&String::from_utf8_lossy(bytes));
                 }
@@ -353,9 +499,11 @@ impl Host {
                 pShaderBytecode: ps.as_ptr().cast(),
                 BytecodeLength: ps.len(),
             },
-            GS: gs.map_or(D3D12_SHADER_BYTECODE::default(), |gs| D3D12_SHADER_BYTECODE {
-                pShaderBytecode: gs.as_ptr().cast(),
-                BytecodeLength: gs.len(),
+            GS: gs.map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
+                D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: gs.as_ptr().cast(),
+                    BytecodeLength: gs.len(),
+                }
             }),
             SampleMask: u32::MAX,
             RasterizerState: D3D12_RASTERIZER_DESC {
@@ -558,7 +706,10 @@ pub fn stub_ps() -> HostShader {
 
 fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
     use super::bitcode::{Attr, Term};
-    let mut s = super::shader::Shader::new(pixel);
+    let profile = super::resolved_shader_profile()
+        .expect("shader profile")
+        .profile;
+    let mut s = super::shader::Shader::new(pixel, profile);
     let b = s.entry;
     for (id, e) in outputs.iter().enumerate() {
         for col in 0..e.cols {
@@ -592,7 +743,11 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         } else {
             crate::native::HwStage::Vs
         },
+        profile,
+        descriptor_aliases: Vec::new(),
+        direct_heap: false,
         dxil: s.finish(),
+        mesh_fallback: None,
         user_data: Vec::new(),
         samplers: Vec::new(),
         static_samplers: Vec::new(),
@@ -624,6 +779,8 @@ pub enum Root {
 #[cfg(test)]
 pub struct Draw<'a> {
     pub roots: Vec<(u32, Root)>,
+    /// SM 6.5 dynamic-heap alias parameters, each bound to its heap's base.
+    pub aliases: &'a [(u32, bool)],
     /// RGBA32F textures (width, height, texels) at view-heap indices 0..
     pub textures: &'a [(u32, u32, &'a [[f32; 4]])],
     /// Samplers at sampler-heap indices 0..
@@ -858,6 +1015,10 @@ impl Host {
                     Root::View { .. } => return Err("root views in a draw".into()),
                 }
             }
+            for &(param, sampler) in d.aliases {
+                let h = if sampler { &sampler_heap } else { &views };
+                list.SetGraphicsRootDescriptorTable(param, h.GetGPUDescriptorHandleForHeapStart());
+            }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
             list.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: w as f32,
@@ -1016,6 +1177,8 @@ pub enum Stride {
 #[cfg(test)]
 pub struct Dispatch<'a> {
     pub roots: Vec<(u32, Root)>,
+    /// SM 6.5 dynamic-heap alias parameters, each bound to its heap's base.
+    pub aliases: &'a [(u32, bool)],
     pub views: &'a [View<'a>],
     pub samplers: &'a [D3D12_SAMPLER_DESC],
     pub groups: [u32; 3],
@@ -1391,6 +1554,10 @@ impl Host {
                         keep.push(b);
                     }
                 }
+            }
+            for &(param, sampler) in d.aliases {
+                let h = if sampler { &samplers } else { &views };
+                list.SetComputeRootDescriptorTable(param, h.GetGPUDescriptorHandleForHeapStart());
             }
             let [x, y, z] = d.groups;
             list.Dispatch(x, y, z);

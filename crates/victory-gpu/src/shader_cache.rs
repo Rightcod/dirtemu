@@ -14,13 +14,30 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{
+    DescriptorAlias, DescriptorClass, HostShader, RayProfile, ShaderProfile, StaticSampler,
+    UserData,
+};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
+
+const DESCRIPTOR_ALIAS_ABI: u32 = 1;
+const DIRECT_HEAP_POLICY: u32 = 1;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Key {
+    mesh_fallback: bool,
+    profile: Option<ShaderProfile>,
+    ray_profile: RayProfile,
+    descriptor_alias_abi: u32,
+    direct_heap_policy: u32,
+}
+
+const KEY_BYTES: usize = 32 + 1 + 1 + 8 + 4 + 4;
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
@@ -91,10 +108,25 @@ fn build() -> &'static [u8; 32] {
 
 /// The translation of a console shader container, from the cache when
 /// there is one.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+pub(crate) fn host_shader(container: &[u8], mesh_fallback: bool) -> Result<HostShader, String> {
+    let mode = if mesh_fallback {
+        victory_shader::emit::MeshTranslation::ComputeFallback
+    } else {
+        victory_shader::emit::MeshTranslation::Hardware
+    };
+    let translate =
+        move |c: &[u8]| victory_shader::emit::translate_mesh(c, mode).map_err(|e| e.to_string());
+    let key = Key {
+        mesh_fallback,
+        profile: victory_shader::emit::resolved_shader_profile()
+            .ok()
+            .map(|resolved| resolved.profile),
+        ray_profile: victory_shader::emit::bvh_profile(),
+        descriptor_alias_abi: DESCRIPTOR_ALIAS_ABI,
+        direct_heap_policy: DIRECT_HEAP_POLICY,
+    };
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached_variant(cache, build(), container, key, translate),
         None => translate(container),
     }
 }
@@ -104,6 +136,7 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 struct Translate<F> {
     translate: F,
     ran: AtomicBool,
+    container: usize,
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
@@ -111,49 +144,78 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
         "shader.dxil"
     }
     fn version(&self) -> u32 {
-        // The build fingerprint in the input does the versioning.
-        1
+        // Bump with the entry encoding and key layout.
+        4
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
+        let shader = (self.translate)(&input[self.container..]).map_err(anyhow::Error::msg)?;
         Ok(encode(&shader))
     }
 }
 
+#[cfg(test)]
 fn cached(
     cache: &Cache,
     build: &[u8; 32],
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
-    let input = [&build[..], container].concat();
+    cached_variant(
+        cache,
+        build,
+        container,
+        Key {
+            mesh_fallback: false,
+            profile: None,
+            ray_profile: RayProfile::Full,
+            descriptor_alias_abi: DESCRIPTOR_ALIAS_ABI,
+            direct_heap_policy: DIRECT_HEAP_POLICY,
+        },
+        translate,
+    )
+}
+
+fn cached_variant(
+    cache: &Cache,
+    build: &[u8; 32],
+    container: &[u8],
+    key: Key,
+    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
+) -> Result<HostShader, String> {
+    let mut input = Vec::with_capacity(KEY_BYTES + container.len());
+    input.extend_from_slice(build);
+    input.push(u8::from(key.mesh_fallback));
+    input.push(key.profile.map_or(0, ShaderProfile::cache_encoding));
+    input.extend_from_slice(&key.ray_profile.cache_encoding().to_le_bytes());
+    input.extend_from_slice(&key.descriptor_alias_abi.to_le_bytes());
+    input.extend_from_slice(&key.direct_heap_policy.to_le_bytes());
+    input.extend_from_slice(container);
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
+        container: KEY_BYTES,
     };
     for _ in 0..2 {
         let path = cache
             .get_or_convert(&converter, &input)
             .map_err(|e| format!("{e:#}"))?;
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
-            let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
-                (&MISSES, "translated and cached")
+            let counter = if converter.ran.load(Ordering::Relaxed) {
+                &MISSES
             } else {
-                (&HITS, "from the cache")
+                &HITS
             };
             counter.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(path = %path.display(), "shader {what}");
             return Ok(shader);
         }
-        tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -195,8 +257,29 @@ fn encode(s: &HostShader) -> Vec<u8> {
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
     let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u32;
     word(&mut out, stage);
+    word(&mut out, u32::from(s.profile.cache_encoding()));
     word(&mut out, s.dxil.len() as u32);
     out.extend(&s.dxil);
+    word(&mut out, s.descriptor_aliases.len() as u32);
+    for alias in &s.descriptor_aliases {
+        word(&mut out, u32::from(alias.class.code()));
+        word(&mut out, alias.space);
+    }
+    word(&mut out, u32::from(s.direct_heap));
+    word(&mut out, u32::from(s.mesh_fallback.is_some()));
+    if let Some(mesh) = &s.mesh_fallback {
+        word(&mut out, mesh.vertex_shader.len() as u32);
+        out.extend(&mesh.vertex_shader);
+        for value in [
+            mesh.group_bytes,
+            mesh.vertex_stride,
+            mesh.primitive_stride,
+            mesh.max_vertices,
+            mesh.max_primitives,
+        ] {
+            word(&mut out, value);
+        }
+    }
     word(&mut out, s.user_data.len() as u32);
     for u in &s.user_data {
         for v in [u.index, u32::from(u.slot), root_code(u.root), u.dword] {
@@ -247,6 +330,20 @@ fn encode(s: &HostShader) -> Vec<u8> {
     out
 }
 
+fn push_alias(shader: &mut HostShader, class: u32, space: u32) -> Option<()> {
+    let class = match class {
+        0 => DescriptorClass::Srv,
+        1 => DescriptorClass::Uav,
+        2 => DescriptorClass::Cbv,
+        3 => DescriptorClass::Sampler,
+        _ => return None,
+    };
+    shader
+        .descriptor_aliases
+        .push(DescriptorAlias { class, space });
+    Some(())
+}
+
 fn decode(bytes: &[u8]) -> Option<HostShader> {
     struct Reader<'a>(&'a [u8]);
     impl<'a> Reader<'a> {
@@ -268,7 +365,37 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         return None;
     }
     let stage = *STAGES.get(r.word()? as usize)?;
+    let profile = match r.word()? {
+        0x65 => ShaderProfile::Sm65,
+        0x66 => ShaderProfile::Sm66,
+        _ => return None,
+    };
     let dxil = r.list()?;
+    let n = r.word()? as usize;
+    let mut descriptor_aliases = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        descriptor_aliases.push((r.word()?, r.word()?));
+    }
+    let direct_heap = match r.word()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let mesh_fallback = match r.word()? {
+        0 => None,
+        1 => {
+            let vertex_shader = r.list()?;
+            Some(victory_shader::emit::MeshFallback {
+                vertex_shader,
+                group_bytes: r.word()?,
+                vertex_stride: r.word()?,
+                primitive_stride: r.word()?,
+                max_vertices: r.word()?,
+                max_primitives: r.word()?,
+            })
+        }
+        _ => return None,
+    };
     let n = r.word()? as usize;
     let mut user_data = Vec::with_capacity(n.min(256));
     for _ in 0..n {
@@ -312,9 +439,16 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
-    r.0.is_empty().then_some(HostShader {
+    if !r.0.is_empty() {
+        return None;
+    }
+    let mut shader = HostShader {
         stage,
+        profile,
         dxil,
+        descriptor_aliases: Vec::new(),
+        direct_heap,
+        mesh_fallback,
         user_data,
         samplers,
         static_samplers,
@@ -322,7 +456,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
-    })
+    };
+    for (class, space) in descriptor_aliases {
+        push_alias(&mut shader, class, space)?;
+    }
+    Some(shader)
 }
 
 #[cfg(test)]
@@ -330,9 +468,24 @@ mod tests {
     use super::*;
 
     fn shader() -> HostShader {
-        HostShader {
+        shader_for(ShaderProfile::Sm65)
+    }
+
+    fn shader_for(profile: ShaderProfile) -> HostShader {
+        let mut shader = HostShader {
             stage: HwStage::Ps,
+            profile,
             dxil: b"DXBC and the rest".to_vec(),
+            descriptor_aliases: Vec::new(),
+            direct_heap: true,
+            mesh_fallback: Some(victory_shader::emit::MeshFallback {
+                vertex_shader: b"vertex DXBC".to_vec(),
+                group_bytes: 256,
+                vertex_stride: 32,
+                primitive_stride: 16,
+                max_vertices: 8,
+                max_primitives: 4,
+            }),
             user_data: vec![UserData {
                 index: 8,
                 slot: 1,
@@ -356,7 +509,10 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
-        }
+        };
+        push_alias(&mut shader, 2, 7).unwrap();
+        push_alias(&mut shader, 3, 2).unwrap();
+        shader
     }
 
     #[test]
@@ -380,7 +536,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH1 broken").unwrap();
+            std::fs::write(e, b"VSH3 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
@@ -390,6 +546,190 @@ mod tests {
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail).is_err());
+    }
+
+    #[test]
+    fn mesh_translation_variants_have_distinct_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [3u8; 32];
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        let hardware_65 = Key {
+            mesh_fallback: false,
+            profile: Some(ShaderProfile::Sm65),
+            ray_profile: RayProfile::Full,
+            descriptor_alias_abi: DESCRIPTOR_ALIAS_ABI,
+            direct_heap_policy: DIRECT_HEAP_POLICY,
+        };
+        let fallback_65 = Key {
+            mesh_fallback: true,
+            ..hardware_65
+        };
+        let hardware_66 = Key {
+            profile: Some(ShaderProfile::Sm66),
+            ..hardware_65
+        };
+        let fallback_66 = Key {
+            mesh_fallback: true,
+            ..hardware_66
+        };
+        cached_variant(&cache, &build, b"mesh", hardware_65, translate).unwrap();
+        cached_variant(&cache, &build, b"mesh", hardware_65, translate).unwrap();
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        cached_variant(&cache, &build, b"mesh", fallback_65, translate).unwrap();
+        cached_variant(&cache, &build, b"mesh", fallback_65, translate).unwrap();
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        cached_variant(&cache, &build, b"mesh", hardware_66, translate).unwrap();
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
+        cached_variant(&cache, &build, b"mesh", fallback_66, translate).unwrap();
+        assert_eq!(runs.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn ray_profiles_and_budgets_have_distinct_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [9u8; 32];
+        let runs = AtomicU64::new(0);
+        let base = Key {
+            mesh_fallback: false,
+            profile: Some(ShaderProfile::Sm65),
+            ray_profile: RayProfile::Full,
+            descriptor_alias_abi: DESCRIPTOR_ALIAS_ABI,
+            direct_heap_policy: DIRECT_HEAP_POLICY,
+        };
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        for (n, profile) in [
+            RayProfile::Full,
+            RayProfile::StaticMiss,
+            RayProfile::Limited(1),
+            RayProfile::Limited(2),
+            RayProfile::Limited(17),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = Key {
+                ray_profile: profile,
+                ..base
+            };
+            cached_variant(&cache, &build, b"ray", key, translate).unwrap();
+            assert_eq!(runs.load(Ordering::Relaxed), n as u64 + 1, "{profile:?}");
+            cached_variant(&cache, &build, b"ray", key, translate).unwrap();
+            assert_eq!(runs.load(Ordering::Relaxed), n as u64 + 1, "{profile:?}");
+        }
+    }
+
+    #[test]
+    fn alias_abi_and_direct_heap_policy_have_distinct_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [5u8; 32];
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        let base = Key {
+            mesh_fallback: false,
+            profile: Some(ShaderProfile::Sm65),
+            ray_profile: RayProfile::Full,
+            descriptor_alias_abi: DESCRIPTOR_ALIAS_ABI,
+            direct_heap_policy: DIRECT_HEAP_POLICY,
+        };
+        cached_variant(&cache, &build, b"abi", base, translate).unwrap();
+        cached_variant(
+            &cache,
+            &build,
+            b"abi",
+            Key {
+                descriptor_alias_abi: DESCRIPTOR_ALIAS_ABI + 1,
+                ..base
+            },
+            translate,
+        )
+        .unwrap();
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        cached_variant(
+            &cache,
+            &build,
+            b"abi",
+            Key {
+                direct_heap_policy: DIRECT_HEAP_POLICY + 1,
+                ..base
+            },
+            translate,
+        )
+        .unwrap();
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn profiles_do_not_share_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [6u8; 32];
+        let runs = AtomicU64::new(0);
+        let key = |profile| Key {
+            mesh_fallback: false,
+            profile: Some(profile),
+            ray_profile: RayProfile::Full,
+            descriptor_alias_abi: DESCRIPTOR_ALIAS_ABI,
+            direct_heap_policy: DIRECT_HEAP_POLICY,
+        };
+        let translate_65 = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader_for(ShaderProfile::Sm65))
+        };
+        let translate_66 = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader_for(ShaderProfile::Sm66))
+        };
+        assert_eq!(
+            cached_variant(
+                &cache,
+                &build,
+                b"profile",
+                key(ShaderProfile::Sm65),
+                translate_65
+            )
+            .unwrap()
+            .profile,
+            ShaderProfile::Sm65
+        );
+        assert_eq!(
+            cached_variant(
+                &cache,
+                &build,
+                b"profile",
+                key(ShaderProfile::Sm66),
+                translate_66
+            )
+            .unwrap()
+            .profile,
+            ShaderProfile::Sm66
+        );
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            cached_variant(
+                &cache,
+                &build,
+                b"profile",
+                key(ShaderProfile::Sm65),
+                translate_65
+            )
+            .unwrap()
+            .profile,
+            ShaderProfile::Sm65
+        );
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
@@ -408,8 +748,24 @@ mod tests {
     fn entries_round_trip_and_reject_damage() {
         let bytes = encode(&shader());
         assert_eq!(decode(&bytes), Some(shader()));
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.profile, ShaderProfile::Sm65);
+        assert!(decoded.direct_heap);
+        assert_eq!(decoded.descriptor_aliases.len(), 2);
+        assert_eq!(decoded.descriptor_aliases[0].class.code(), 2);
+        assert_eq!(decoded.descriptor_aliases[0].space, 7);
+        assert_eq!(decoded.descriptor_aliases[1].class.code(), 3);
+        assert_eq!(decoded.descriptor_aliases[1].space, 2);
+        let mut sm66 = shader_for(ShaderProfile::Sm66);
+        sm66.direct_heap = false;
+        assert_eq!(decode(&encode(&sm66)), Some(sm66));
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
+        let mut wrong_profile = bytes.clone();
+        wrong_profile[8..12].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(decode(&wrong_profile), None);
         assert_eq!(decode(b"VSH0"), None);
+        assert_eq!(decode(b"VSH1"), None);
+        assert_eq!(decode(b"VSH2"), None);
     }
 }

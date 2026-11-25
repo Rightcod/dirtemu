@@ -384,6 +384,10 @@ fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Pages this process has created sections for, since the start: the
+/// profile's page-pool budget is checked against it.
+static PHYSICAL_BYTES: AtomicUsize = AtomicUsize::new(0);
+
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
@@ -398,6 +402,26 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
+    // The profile's page-pool budget is checked here, before Windows is
+    // asked: a title over it gets this call refused with a line naming the
+    // budget, not a commit failure deep in a later mapping.
+    let limits = victory_gpu::console::limits();
+    let reserved = PHYSICAL_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+        limits
+            .admits_page_pool(reserved as u64, size as u64)
+            .then_some(reserved + size)
+    });
+    if reserved.is_err() {
+        tracing::error!(
+            n,
+            size_mb = size >> 20,
+            cap_mb = limits.page_pool_bytes() >> 20,
+            "XMemAllocatePhysicalPages over the memory profile's page-pool budget; refusing (raise VICTORY_MEMORY_PROFILE or lower the title's streaming)"
+        );
+        // SAFETY: checked non-null.
+        unsafe { count.write(0) };
+        return 0;
+    }
     // A pagefile-backed section of `size` bytes, its pages committed when
     // first mapped or written (`commit`): the title asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
@@ -418,6 +442,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     };
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
+        PHYSICAL_BYTES.fetch_sub(size, Ordering::Relaxed);
         tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
         // SAFETY: checked non-null.
         unsafe { count.write(0) };
@@ -873,7 +898,7 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     };
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
-    let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
+    let (gpu_optimal, standard) = victory_gpu::console::effective_title_memory();
     let stats = WorkingSet {
         title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
         title_used: counters.PagefileUsage,
@@ -915,7 +940,7 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
     let Some(size) = size.checked_next_multiple_of(2 * MIB) else {
         return 0;
     };
-    let standard = victory_gpu::console::current().title_memory().1;
+    let standard = victory_gpu::console::effective_title_memory().1;
     let moved = kind == TITLE_TO_SYSTEM
         && TRANSFERRED
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
@@ -1032,7 +1057,7 @@ mod tests {
         assert!(before.title_used > 0);
         assert_eq!(XMemTransferMemory(0, 128 * MIB - 1), 1);
         assert_eq!(XMemTransferMemory(2, MIB), 0, "no tools memory");
-        let standard = victory_gpu::console::current().title_memory().1;
+        let standard = victory_gpu::console::effective_title_memory().1;
         assert_eq!(XMemTransferMemory(0, standard), 0, "over budget");
         let mut after = WorkingSet::default();
         XMemGetWorkingSetStatistics(0x2000_0001, &mut after);
@@ -1044,6 +1069,19 @@ mod tests {
         assert_eq!(size_of::<WorkingSet>(), 0x50);
         assert_eq!(size_of::<BasicInformation>(), 0x40);
         assert_eq!(std::mem::offset_of!(WorkingSet, gpu_optimal_limit), 0x28);
+    }
+
+    #[test]
+    fn the_page_pool_budget_admits_the_titles_six_gib_and_refuses_past_it() {
+        let limits = victory_gpu::console::limits();
+        let cap = limits.page_pool_bytes();
+        if cap == 0 {
+            return;
+        }
+        assert!(limits.admits_page_pool(0, 6 * 1024 * MIB as u64));
+        assert!(limits.admits_page_pool(0, cap));
+        assert!(!limits.admits_page_pool(cap, 1));
+        assert!(!limits.admits_page_pool(cap - 1, PAGE as u64));
     }
 
     #[test]

@@ -60,12 +60,39 @@ pub fn rect_list_gs(vs: &[u8], ps: Option<&[u8]>) -> Result<Vec<u8>, ShaderError
         Some(ps) => sig(ps, FourCC::ISG1)?,
         None => Vec::new(),
     };
-    build(outputs, &wanted)
+    // The geometry stage is emitted for the vertex shader's own shader
+    // model, so a pipeline translated for SM 6.5 never gets an SM 6.6
+    // stage (and the other way round). Only a container whose model cannot
+    // be read falls back on the device's effective profile.
+    let profile = match profile_of(vs).or_else(|| ps.and_then(profile_of)) {
+        Some(profile) => profile,
+        None => {
+            super::resolved_shader_profile()
+                .map_err(ShaderError::Profile)?
+                .profile
+        }
+    };
+    build(outputs, &wanted, profile)
+}
+
+/// The shader model a DXIL container declares, when it is one we emit.
+fn profile_of(dxil: &[u8]) -> Option<super::ShaderProfile> {
+    let container = Container::parse(dxil).ok()?;
+    let program = crate::DxilProgram::parse(container.part(FourCC::DXIL)?.data).ok()?;
+    match program.shader_model {
+        (6, 5) => Some(super::ShaderProfile::Sm65),
+        (6, 6) => Some(super::ShaderProfile::Sm66),
+        _ => None,
+    }
 }
 
 /// [`rect_list_gs`] from the vertex shader's outputs and the pixel
-/// shader's inputs.
-fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u8>, ShaderError> {
+/// shader's inputs, emitted for `profile`.
+fn build(
+    mut outputs: Vec<SigElement>,
+    ps_inputs: &[SigElement],
+    profile: super::ShaderProfile,
+) -> Result<Vec<u8>, ShaderError> {
     let unsupported = |what| ShaderError::Unsupported { offset: 0, what };
     if outputs.iter().any(|e| e.row.is_none()) {
         return Err(unsupported("a rectangle list output without a register"));
@@ -74,7 +101,9 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         .iter()
         .position(|e| e.kind == 3 && e.comp == 9 && e.cols == 4)
     else {
-        return Err(unsupported("a rectangle list without a four-component position"));
+        return Err(unsupported(
+            "a rectangle list without a four-component position",
+        ));
     };
     for e in &mut outputs {
         // Interpolation as `emit_program` declares a vertex shader's
@@ -87,7 +116,7 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         };
         e.usage = (1 << e.cols) - 1;
     }
-    let mut s = Shader::new(false);
+    let mut s = Shader::new(false, profile);
     s.geometry = Some(Geometry {
         max_vertices: VERTICES,
     });
@@ -248,12 +277,7 @@ fn load(s: &mut Shader, id: usize, col: u8, vertex: u32) -> V {
     } else {
         ("loadInput.i32", s.t.i32)
     };
-    let args = [
-        s.m.i32(id as u32),
-        s.m.i32(0),
-        s.m.i8(col),
-        s.m.i32(vertex),
-    ];
+    let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), s.m.i32(vertex)];
     let entry = s.entry;
     s.op(entry, name, Attr::ReadNone, ty, 4, &args)
 }
@@ -307,6 +331,12 @@ mod tests {
         ]
     }
 
+    fn effective_profile() -> super::super::ShaderProfile {
+        super::super::resolved_shader_profile()
+            .expect("shader profile")
+            .profile
+    }
+
     /// The stage is a geometry shader of triangles in and six strip
     /// vertices out, with the vertex shader's outputs on both sides and
     /// the primitive id the pixel shader declares; the validator, where
@@ -314,10 +344,15 @@ mod tests {
     #[test]
     fn the_rectangle_stage_is_a_geometry_shader() {
         let wanted = [element("SV_PrimitiveID", 0, 10, 5, 3, 1)];
-        let gs = build(outputs(), &wanted).unwrap();
+        let profile = effective_profile();
+        let gs = build(outputs(), &wanted, profile).unwrap();
         let c = Container::parse(&gs).unwrap();
-        // Program version: geometry (2), shader model 6.6.
-        assert_eq!(c.part(FourCC::DXIL).unwrap().data[..4], [0x66, 0, 2, 0]);
+        // Program version: geometry (2), the effective shader model.
+        let minor = profile.shader_model().1;
+        assert_eq!(
+            c.part(FourCC::DXIL).unwrap().data[..4],
+            [0x60 | minor, 0, 2, 0]
+        );
         let psv = c.part(FourCC::PSV0).unwrap().data;
         // Triangles in, triangle strips out, stream 0, a position.
         assert_eq!(psv[4..17], [3, 0, 0, 0, 5, 0, 0, 0, 1, 0, 0, 0, 1]);
@@ -337,21 +372,38 @@ mod tests {
             super::super::validator::Validator::default_path().as_deref(),
         ) {
             v.validate(&mut gs.clone()).unwrap();
-            let plain = build(outputs(), &[]).unwrap();
+            let plain = build(outputs(), &[], profile).unwrap();
             v.validate(&mut plain.clone()).unwrap();
         }
+    }
+
+    /// The geometry stage follows the vertex shader's declared model, not
+    /// the process-wide default: an SM 6.5 pipeline stays SM 6.5.
+    #[test]
+    fn the_rectangle_stage_takes_the_vertex_shaders_profile() {
+        let mut vs = Shader::new(false, super::super::ShaderProfile::Sm65);
+        vs.outputs = outputs();
+        vs.m.terminate(vs.entry, Term::Ret);
+        let dxil = vs.finish();
+        let gs = rect_list_gs(&dxil, None).unwrap();
+        let c = Container::parse(&gs).unwrap();
+        let program = crate::DxilProgram::parse(c.part(FourCC::DXIL).unwrap().data).unwrap();
+        assert_eq!(program.kind, crate::ShaderKind::Geometry);
+        assert_eq!(program.shader_model, (6, 5));
+        assert_eq!(c.part(FourCC::DXIL).unwrap().data[..4], [0x65, 0, 2, 0]);
     }
 
     /// Refused with a reason: no position, a primitive id in a register a
     /// vertex output has, more components than six vertices may carry.
     #[test]
     fn rectangle_stages_that_cannot_be_made_are_refused() {
-        assert!(build(outputs()[1..].to_vec(), &[]).is_err());
+        let profile = effective_profile();
+        assert!(build(outputs()[1..].to_vec(), &[], profile).is_err());
         let taken = [element("SV_PrimitiveID", 0, 10, 5, 1, 1)];
-        assert!(build(outputs(), &taken).is_err());
+        assert!(build(outputs(), &taken, profile).is_err());
         let mut many = vec![element("SV_Position", 0, 3, 9, 0, 4)];
         many.extend((1..=43).map(|row| element("TEXCOORD", row - 1, 0, 9, row, 4)));
-        assert!(build(many, &[]).is_err());
+        assert!(build(many, &[], profile).is_err());
     }
 
     /// A vertex shader that passes a position and a float4 through, and a
@@ -368,7 +420,10 @@ mod tests {
             usage: 15,
             ..element("TEXCOORD", 0, 0, 9, 1, 4)
         };
-        let mut vs = Shader::new(false);
+        let profile = super::super::resolved_shader_profile()
+            .expect("shader profile")
+            .profile;
+        let mut vs = Shader::new(false, profile);
         vs.inputs = vec![
             SigElement {
                 usage: 15,
@@ -380,7 +435,7 @@ mod tests {
             },
         ];
         vs.outputs = vec![position.clone(), coord.clone()];
-        let mut ps = Shader::new(true);
+        let mut ps = Shader::new(true, profile);
         ps.inputs = vec![
             SigElement {
                 usage: 0,
@@ -407,7 +462,11 @@ mod tests {
         }
         let host = |stage, s: Shader| super::super::HostShader {
             stage,
+            profile,
+            descriptor_aliases: Vec::new(),
+            direct_heap: false,
             dxil: s.finish(),
+            mesh_fallback: None,
             user_data: Vec::new(),
             samplers: Vec::new(),
             static_samplers: Vec::new(),
@@ -458,6 +517,7 @@ mod tests {
                     .unwrap();
                 let d = Draw {
                     roots: Vec::new(),
+                    aliases: &[],
                     textures: &[],
                     samplers: &[],
                     vertices: &vertices,
@@ -478,7 +538,10 @@ mod tests {
             }
             let half = draw(None);
             let missing = half.iter().zip(&whole).filter(|(a, b)| a != b).count();
-            assert!(missing >= 24, "{name}: only {missing} texels need the stage");
+            assert!(
+                missing >= 24,
+                "{name}: only {missing} texels need the stage"
+            );
         }
     }
 }

@@ -17,3 +17,12 @@ game_dir = 'D:\victory-data\game'
 # Other Xbox Series titles used to test platform-level code.
 # env: VICTORY_TEST_TITLES (separated by ';')
 test_titles = []
+
+[memory]
+# auto | series-s | series-x | off.            env: VICTORY_MEMORY_PROFILE
+#
+# auto picks series-s (about 7.6 GiB of title memory and small host caches)
+# on a card with 8 GiB of video memory or less, a PC with 20 GiB of RAM or
+# less, or a small Windows commit limit; series-x otherwise. off keeps the
+# console's figure and no host-side caps.
+# profile = 'auto'

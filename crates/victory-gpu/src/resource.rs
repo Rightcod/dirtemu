@@ -110,6 +110,7 @@ const _: () = assert!(size_of::<HeapDesc>() == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
 
 const BUFFER: u32 = 1;
+const TEXTURE_1D: u32 = 2;
 const TEXTURE_3D: u32 = 4;
 
 /// Bytes per element and the element's width in texels (4 for block
@@ -237,6 +238,111 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+pub(crate) fn console_only_format(format: u32) -> bool {
+    matches!(format, 116 | 117 | 189..=191)
+}
+
+pub(crate) fn bc3_stand_in(format: u32) -> Option<u32> {
+    Some(match format {
+        76 => 27,
+        77 => 28,
+        78 => 29,
+        _ => return None,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Bc3Host {
+    Native,
+    Decode(u32),
+    Refuse(&'static str),
+}
+
+pub(crate) fn bc3_host(desc: &ResourceDesc, unaligned: bool) -> Bc3Host {
+    if desc.dimension == BUFFER || element(desc.format).is_none_or(|(_, block)| block != 4) {
+        return Bc3Host::Native;
+    }
+    let needs_fallback = desc.dimension == TEXTURE_1D
+        || (!unaligned && (desc.width % 4 != 0 || u64::from(desc.height) % 4 != 0));
+    if !needs_fallback {
+        return Bc3Host::Native;
+    }
+    if desc.sample_count > 1 {
+        return Bc3Host::Refuse("multisampled block-compressed texture");
+    }
+    match bc3_stand_in(desc.format) {
+        Some(format) => Bc3Host::Decode(format),
+        None => Bc3Host::Refuse("only sampled BC3 has a decoded fallback"),
+    }
+}
+
+pub(crate) fn bc3_view_format(host: u32, view: u32) -> Option<u32> {
+    let stand_in = match view {
+        76 | 77 => 28,
+        78 => 29,
+        _ => return None,
+    };
+    (host == stand_in || (is_typeless(host) && family(host) == family(stand_in)))
+        .then_some(stand_in)
+}
+
+#[cfg(windows)]
+pub(crate) fn unaligned_block_textures_supported() -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let Some(host) = crate::host::host() else {
+            return false;
+        };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS8::default();
+        let asked = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS8,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        };
+        asked.is_ok() && options.UnalignedBlockTexturesSupported.as_bool()
+    })
+}
+
+#[cfg(windows)]
+pub(crate) fn bc3_decoded(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let own = pc_format(resource(this).desc.format);
+    let Some(stand_in) = bc3_stand_in(own) else {
+        return false;
+    };
+    host_resource(this).is_some_and(|host| {
+        let host_format = unsafe { host.GetDesc() }.Format.0 as u32;
+        family(host_format) == family(stand_in)
+    })
+}
+
+fn resource_format_ok(desc: &ResourceDesc) -> bool {
+    if console_only_format(desc.format) {
+        tracing::warn!(
+            ?desc,
+            format = desc.format,
+            "console-only resource format has no PC DXGI mapping"
+        );
+        return false;
+    }
+    true
+}
+
+#[cfg(windows)]
+fn packed_target_supported(support1: i32, support2: i32) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let required1 =
+        D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+    let required2 =
+        D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD.0 | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0;
+    support1 & required1 == required1 && support2 & required2 == required2
+}
+
 /// The format of a texture the host GPU renders to or writes as unordered
 /// access, for the title's `format`. The console's GPU does both with the
 /// 16-bit colour formats B5G5R5A1 (86) and B4G4R4A4 (115), and
@@ -275,11 +381,13 @@ pub(crate) fn target_format(format: u32) -> u32 {
                         size_of_val(&support) as u32,
                     )
                 };
-                let both = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0
-                    | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
-                let refused = asked.is_err() || support.Support1.0 & both != both;
+                let refused = asked.is_err()
+                    || !packed_target_supported(support.Support1.0, support.Support2.0);
                 if refused {
-                    tracing::info!(format = f, "the host does not render to this format: 8-bit RGBA stands in");
+                    tracing::info!(
+                        format = f,
+                        "the host does not render to this format: 8-bit RGBA stands in"
+                    );
                 }
                 refused
             })
@@ -606,8 +714,63 @@ pub(crate) fn family(format: u32) -> u32 {
     }
 }
 
+pub(crate) fn is_typeless(format: u32) -> bool {
+    family(format) == format
+        && format
+            .checked_add(1)
+            .is_some_and(|next| family(next) == format)
+}
+
+pub(crate) fn default_shader_format(format: u32) -> Option<u32> {
+    let format = pc_format(format);
+    Some(match format {
+        1 => 2,
+        5 => 6,
+        9 => 10,
+        15 => 16,
+        19 | 20 => 21,
+        23 => 24,
+        27 => 28,
+        33 => 34,
+        39 | 40 => 41,
+        44 | 45 => 46,
+        48 => 49,
+        53 | 55 => 56,
+        60 => 61,
+        70 => 71,
+        73 => 74,
+        76 => 77,
+        79 => 80,
+        82 => 83,
+        90 => 87,
+        92 => 88,
+        94 => return None,
+        97 => 98,
+        f if is_typeless(f) => return None,
+        f => f,
+    })
+}
+
 /// sRGB formats and their linear twins.
-pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
+pub(crate) const SRGB: [(u32, u32); 7] = [
+    (29, 28),
+    (72, 71),
+    (75, 74),
+    (78, 77),
+    (91, 87),
+    (93, 88),
+    (99, 98),
+];
+
+pub(crate) fn srgb_linear_pair(a: u32, b: u32) -> bool {
+    SRGB.iter()
+        .any(|&(srgb, linear)| (a == srgb && b == linear) || (a == linear && b == srgb))
+}
+
+fn srgb_family(format: u32) -> bool {
+    let family = family(format);
+    SRGB.iter().any(|&(srgb, _)| self::family(srgb) == family)
+}
 
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
@@ -618,6 +781,9 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     let own = pc_format(resource(this).desc.format);
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
+    if let Some(stand_in) = bc3_view_format(format, own) {
+        return Some(stand_in);
+    }
     // A stand-in target is typed.
     (format != own && format != target_format(own)).then_some(own)
 }
@@ -1281,7 +1447,70 @@ pub(crate) fn host_waits(this: This) -> bool {
     let r = resource(this);
     r.desc.dimension != BUFFER
         && !r.host.refused.load(std::sync::atomic::Ordering::Relaxed)
-        && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+        && r.host
+            .made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
+}
+
+/// Serializes sampled host-copy creation against the texture budget.
+#[cfg(windows)]
+static TEXTURE_BUDGET: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The last forced sweep of idle sampled copies (at most every 200 ms).
+#[cfg(windows)]
+static TEXTURE_SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bytes a host copy of `desc` is expected to take: the console layout's,
+/// with room for a higher-resolution stand-in (a decoded block texture is
+/// four times as wide). `None` for targets and buffers, which are never
+/// budgeted.
+#[cfg(windows)]
+fn host_texture_estimate(desc: &ResourceDesc) -> Option<u64> {
+    if !fills(desc) {
+        return None;
+    }
+    let bytes = footprint(desc)?.size;
+    let bytes = if matches!(bc3_host(desc, false), Bc3Host::Decode(_)) {
+        bytes.saturating_mul(4)
+    } else {
+        bytes
+    };
+    Some(
+        bytes
+            .next_multiple_of(KIB_64)
+            .saturating_add(bytes / 8)
+            .next_multiple_of(KIB_64),
+    )
+}
+
+/// Whether a host copy of `desc` of `bytes` fits the profile, `used` bytes of
+/// sampled copies alive. Targets, depth and unordered-access textures always
+/// fit.
+#[cfg(windows)]
+fn texture_fits(desc: &ResourceDesc, bytes: u64, used: u64) -> bool {
+    !fills(desc) || crate::console::limits().admits_texture(used, bytes)
+}
+
+/// One line for a refusal, throttled: the first few and then every 1,024th.
+#[cfg(windows)]
+fn say_texture_refused(desc: &ResourceDesc, bytes: u64, used: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static REFUSED: AtomicU64 = AtomicU64::new(0);
+    let n = REFUSED.fetch_add(1, Relaxed);
+    if n < 8 || n.is_multiple_of(1024) {
+        let limits = crate::console::limits();
+        tracing::warn!(
+            desc = ?desc,
+            bytes_mb = bytes >> 20,
+            used_mb = used >> 20,
+            limit_mb = limits.texture_bytes >> 20,
+            single_mb = limits.texture_single_bytes >> 20,
+            refusals = n + 1,
+            "sampled streamed texture over the memory profile's texture budget: no host copy (the texture is not sampled)"
+        );
+    }
 }
 
 /// The host side of title texture `this`: made now if it is not there and
@@ -1293,6 +1522,25 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     if r.desc.dimension == BUFFER {
         return None;
     }
+    if make && !r.host.refused.load(Relaxed) {
+        // A sampled host copy over the profile's budget: let go of the ones
+        // nothing names, without holding this texture's lock (the sweep takes
+        // it for each texture).
+        let limits = crate::console::limits();
+        if let Some(estimate) = host_texture_estimate(&r.desc)
+            && !limits.admits_texture(KINDS[1].load(Relaxed), estimate)
+        {
+            let now = crate::host::moment();
+            let last = TEXTURE_SWEPT.load(Relaxed);
+            if crate::host::long_ago(last, 200, 0)
+                && TEXTURE_SWEPT
+                    .compare_exchange(last, now, Relaxed, Relaxed)
+                    .is_ok()
+            {
+                sweep_idle(0, 0);
+            }
+        }
+    }
     let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
     if made.is_none() {
         if !make || r.host.refused.load(Relaxed) {
@@ -1303,10 +1551,27 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
+        // The sampled, streamed host copies share one budget. Creation is
+        // serialized so two threads cannot both see room for the same bytes;
+        // render targets, depth targets and unordered-access targets are
+        // never counted and never refused.
+        let _budget =
+            fills(&r.desc).then(|| TEXTURE_BUDGET.lock().unwrap_or_else(|e| e.into_inner()));
+        if let Some(estimate) = host_texture_estimate(&r.desc)
+            && !texture_fits(&r.desc, estimate, KINDS[1].load(Relaxed))
+        {
+            say_texture_refused(&r.desc, estimate, KINDS[1].load(Relaxed));
+            return None;
+        }
         let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
+        let actual = host_bytes(&texture);
+        if !texture_fits(&r.desc, actual, KINDS[1].load(Relaxed)) {
+            say_texture_refused(&r.desc, actual, KINDS[1].load(Relaxed));
+            return None;
+        }
         let twin = twin_texture(&r.desc, &texture);
         // One line per depth texture with unordered access: its address is
         // the one target dumps and the captured frame's list of commands
@@ -1367,12 +1632,19 @@ pub(crate) fn room() -> bool {
     const FLOOR: u64 = 2 << 30;
     const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
+    let env_limit = *LIMIT.get_or_init(|| {
         let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
         mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
     });
     let filled = KINDS[1].load(Relaxed);
-    if let Some(limit) = limit {
+    let profile = crate::console::limits().texture_bytes;
+    if profile > 0 {
+        // The profile's cap is the ceiling; a smaller explicit budget may
+        // lower it, and cannot raise it.
+        let limit = env_limit.map_or(profile, |asked| asked.min(profile));
+        return filled < limit;
+    }
+    if let Some(limit) = env_limit {
         return filled < limit;
     }
     if filled < FLOOR {
@@ -1409,9 +1681,14 @@ pub(crate) fn room() -> bool {
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
+    sweep_idle(5_000, 4);
+}
+
+/// The sweep behind [`let_go_idle`]; `ms` and `frames` 0 force it for the
+/// texture budget, whose refusals must first give back what nothing names.
+#[cfg(windows)]
+fn sweep_idle(ms: u64, frames: u64) {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_MS: u64 = 5_000;
-    const IDLE_FRAMES: u64 = 4;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
@@ -1430,7 +1707,7 @@ pub(crate) fn let_go_idle() {
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), IDLE_MS, IDLE_FRAMES)
+                crate::host::long_ago(r.host.used.load(Relaxed), ms, frames)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -1502,7 +1779,9 @@ pub(crate) fn census() -> [u64; 10] {
                     placed_filled += 1;
                     // Its first page: a texture's smallest mips lie there,
                     // and are mapped first and unmapped last.
-                    if placed_filled.is_multiple_of(EVERY) && !crate::texture::committed(r.data().cast_const(), 1) {
+                    if placed_filled.is_multiple_of(EVERY)
+                        && !crate::texture::committed(r.data().cast_const(), 1)
+                    {
                         count[8] += host.bytes * EVERY;
                         if crate::host::references(&host.texture) > 1 {
                             count[9] += host.bytes * EVERY;
@@ -1527,20 +1806,25 @@ pub(crate) static HOST_TEXTURES: [std::sync::atomic::AtomicU64; 2] =
 
 /// The bytes the host allocates for `texture`.
 #[cfg(windows)]
-fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u64 {
+pub(crate) fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u64 {
     let Some(host) = crate::host::host() else {
         return 0;
     };
     // SAFETY: plain queries on a live resource and device.
     unsafe {
         let desc = texture.GetDesc();
-        host.device.GetResourceAllocationInfo(0, &[desc]).SizeInBytes
+        host.device
+            .GetResourceAllocationInfo(0, &[desc])
+            .SizeInBytes
     }
 }
 
 #[cfg(windows)]
 impl HostTexture {
-    fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
+    fn new(
+        texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        state: u32,
+    ) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
@@ -1571,7 +1855,10 @@ impl Drop for HostTexture {
 /// (never released), for the memory line.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_textures() -> u64 {
-    PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).len() as u64
+    PLACED_TEXTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len() as u64
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -1627,7 +1914,22 @@ fn host_texture(
     if desc.dimension == BUFFER {
         return None;
     }
+    if !resource_format_ok(desc) {
+        return None;
+    }
     let host = crate::host::host()?;
+    let bc3 = bc3_host(desc, unaligned_block_textures_supported());
+    if let Bc3Host::Refuse(reason) = bc3 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(?desc, reason, "block-compressed texture has no host fallback");
+        });
+        return None;
+    }
+    if matches!(bc3, Bc3Host::Decode(_)) && !fills(desc) {
+        tracing::warn!(?desc, "BC3 decode fallback is for sampled textures only");
+        return None;
+    }
     let mut d = *desc;
     d.layout = 0;
     d.alignment = 0;
@@ -1644,7 +1946,13 @@ fn host_texture(
         }
         d.flags &= !UNORDERED;
     }
-    d.format = pc_format(d.format);
+    d.format = match bc3 {
+        Bc3Host::Decode(format) => format,
+        _ => pc_format(d.format),
+    };
+    if srgb_family(d.format) {
+        d.format = family(d.format);
+    }
     const TARGET: u32 = 1;
     if d.flags & (TARGET | UNORDERED) != 0 {
         d.format = target_format(d.format);
@@ -1655,14 +1963,9 @@ fn host_texture(
     {
         d.format = typeless;
     }
-    // The host has no sRGB unordered access: such textures are typeless,
-    // their unordered access views plain UNORM.
-    if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
-        d.format = family(d.format);
-    }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    let clear_value = (!clear.is_null() && !matches!(bc3, Bc3Host::Decode(_))).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
@@ -1696,10 +1999,17 @@ fn host_texture(
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+            format!(
+                "texture {}x{} f{} flags {:#x}",
+                d.width, d.height, d.format, d.flags
+            )
         });
     }
     texture
+}
+
+pub(crate) fn texture_format(desc: &ResourceDesc) -> u32 {
+    desc.format
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -1869,6 +2179,9 @@ pub(crate) extern "system" fn create_committed(
     let (Some(&heap), Some(&desc)) = (unsafe { (heap.as_ref(), desc.as_ref()) }) else {
         return E_INVALIDARG;
     };
+    if !resource_format_ok(&desc) {
+        return E_INVALIDARG;
+    }
     let Some(info) = footprint(&desc) else {
         tracing::warn!(?desc, "no size for this resource");
         return E_INVALIDARG;
@@ -1977,6 +2290,9 @@ pub(crate) extern "system" fn create_at_address(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    if !resource_format_ok(&desc) {
+        return E_INVALIDARG;
+    }
     if address == 0 {
         return E_INVALIDARG;
     }
@@ -2079,6 +2395,9 @@ pub(crate) extern "system" fn create_placed(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    if !resource_format_ok(&desc) {
+        return E_INVALIDARG;
+    }
     if heap.is_null() {
         return E_INVALIDARG;
     }
@@ -2382,6 +2701,135 @@ mod tests {
             create(device, 0, &desc, u32::MAX, null, &RESOURCE_IIDS[0], &mut r),
             0
         );
+    }
+
+    #[test]
+    fn bc3_host_falls_back_only_for_unsupported_block_shapes() {
+        let five = [
+            ("scope", 3193u64, 1579u32, 5_120_000u64),
+            ("hud", 634, 634, 409_600),
+            ("signal", 613, 149, 122_880),
+            ("bar_full", 1500, 51, 98_304),
+            ("bar_empty", 1500, 51, 98_304),
+        ];
+        let mut extra = 0u64;
+        for (name, width, height, allocation) in five {
+            let desc = texture(width, height, 77, 1);
+            assert_eq!(bc3_host(&desc, false), Bc3Host::Decode(28), "{name}");
+            assert_eq!(bc3_host(&desc, true), Bc3Host::Native, "{name}");
+            assert_eq!((desc.width, desc.height), (width, height), "{name}");
+            assert_eq!(
+                texture_layout(&desc).expect(name).size,
+                allocation,
+                "{name}"
+            );
+            let bc3 = footprint(&desc).expect(name).size;
+            let rgba = footprint(&ResourceDesc { format: 28, ..desc })
+                .expect(name)
+                .size;
+            assert!(rgba > bc3, "{name}");
+            extra += rgba - bc3;
+        }
+        assert!(extra <= 24 << 20, "{} bytes", extra);
+        assert_eq!(
+            bc3_host(&texture(3192, 1576, 77, 1), false),
+            Bc3Host::Native
+        );
+        assert_eq!(
+            bc3_host(&texture(3193, 1579, 78, 1), false),
+            Bc3Host::Decode(29)
+        );
+        assert_eq!(
+            bc3_host(&texture(3193, 1579, 76, 1), false),
+            Bc3Host::Decode(27)
+        );
+        let one_d = ResourceDesc {
+            dimension: TEXTURE_1D,
+            height: 1,
+            ..texture(613, 1, 77, 1)
+        };
+        assert_eq!(bc3_host(&one_d, true), Bc3Host::Decode(28));
+        let bc1 = texture(3193, 1579, 71, 1);
+        assert!(matches!(bc3_host(&bc1, false), Bc3Host::Refuse(_)));
+        assert_eq!(bc3_host(&bc1, true), Bc3Host::Native);
+        assert_eq!(
+            bc3_host(&texture(3192, 1576, 71, 1), false),
+            Bc3Host::Native
+        );
+        let msaa = ResourceDesc {
+            sample_count: 2,
+            ..texture(3193, 1579, 77, 1)
+        };
+        assert!(matches!(bc3_host(&msaa, false), Bc3Host::Refuse(_)));
+        assert_eq!(bc3_stand_in(76), Some(27));
+        assert_eq!(bc3_stand_in(77), Some(28));
+        assert_eq!(bc3_stand_in(78), Some(29));
+        assert_eq!(bc3_view_format(27, 76), Some(28));
+        assert_eq!(bc3_view_format(27, 77), Some(28));
+        assert_eq!(bc3_view_format(27, 78), Some(29));
+        assert_eq!(bc3_view_format(28, 77), Some(28));
+        assert_eq!(bc3_view_format(76, 77), None);
+        assert_eq!(bc3_view_format(27, 28), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bc3_host_uses_the_hosts_unaligned_block_support() {
+        let support = unaligned_block_textures_supported();
+        let desc = texture(3193, 1579, 77, 1);
+        let expected = if support {
+            Bc3Host::Native
+        } else {
+            Bc3Host::Decode(28)
+        };
+        assert_eq!(bc3_host(&desc, support), expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn aligned_bc3_host_textures_stay_native() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        for (width, height) in [(8u64, 8u32), (100, 60), (3192, 1576)] {
+            let desc = texture(width, height, 77, 1);
+            let texture = host_texture(&desc, 0, std::ptr::null()).expect("native BC3");
+            // SAFETY: a live resource.
+            let d = unsafe { texture.GetDesc() };
+            assert_eq!(
+                (d.Width, d.Height, d.Format.0 as u32),
+                (width, height, 76),
+                "{width}x{height}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn decoded_bc3_host_textures_keep_the_five_descriptor_sizes() {
+        if unaligned_block_textures_supported() {
+            return;
+        }
+        if crate::host::host().is_none() {
+            return;
+        }
+        for (name, width, height) in [
+            ("scope", 3193u64, 1579u32),
+            ("hud", 634, 634),
+            ("signal", 613, 149),
+            ("bar_full", 1500, 51),
+            ("bar_empty", 1500, 51),
+        ] {
+            let desc = texture(width, height, 77, 1);
+            let texture = host_texture(&desc, 0, std::ptr::null()).expect(name);
+            // SAFETY: a live resource.
+            let d = unsafe { texture.GetDesc() };
+            assert_eq!(
+                (d.Width, d.Height, d.Format.0 as u32, d.MipLevels),
+                (width, height, 27, 1),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -3350,6 +3798,215 @@ float4 lit() : SV_Target { return 1.0; }
     }
 
     #[test]
+    fn console_only_formats_fail_before_resource_creation() {
+        for format in [116, 117, 189, 190, 191] {
+            assert_eq!(pc_format(format), format, "no invented mapping");
+            assert!(console_only_format(format));
+        }
+        let null = std::ptr::null();
+        let memory = heap(2 * KIB_64);
+        for format in [116, 117, 189, 190, 191] {
+            let desc = texture(4, 4, format, 1);
+            let mut out = null;
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &desc,
+                    0,
+                    null.cast(),
+                    &RESOURCE_IIDS[0],
+                    &mut out,
+                ),
+                E_INVALIDARG,
+                "committed format {format}"
+            );
+            assert!(out.is_null());
+            assert_eq!(
+                create_at_address(
+                    null,
+                    0x1_0000,
+                    &desc,
+                    0,
+                    null.cast(),
+                    &RESOURCE_IIDS[0],
+                    &mut out,
+                ),
+                E_INVALIDARG,
+                "address format {format}"
+            );
+            assert!(out.is_null());
+            assert_eq!(
+                create_placed(
+                    null,
+                    memory,
+                    0,
+                    &desc,
+                    0,
+                    null.cast(),
+                    &RESOURCE_IIDS[0],
+                    &mut out,
+                ),
+                E_INVALIDARG,
+                "placed format {format}"
+            );
+            assert!(out.is_null());
+        }
+        assert_eq!(slot::<Release>(memory, 0x10)(memory), 0);
+    }
+
+    #[test]
+    fn default_shader_formats_are_typed_and_depth_plane_aware() {
+        for (typeless, typed) in [
+            (1, 2),
+            (5, 6),
+            (9, 10),
+            (15, 16),
+            (19, 21),
+            (23, 24),
+            (27, 28),
+            (33, 34),
+            (39, 41),
+            (44, 46),
+            (48, 49),
+            (53, 56),
+            (60, 61),
+            (70, 71),
+            (73, 74),
+            (76, 77),
+            (79, 80),
+            (82, 83),
+            (90, 87),
+            (92, 88),
+            (97, 98),
+        ] {
+            assert!(is_typeless(typeless));
+            assert_eq!(default_shader_format(typeless), Some(typed));
+        }
+        for (depth, shader) in [(20, 21), (40, 41), (45, 46), (55, 56)] {
+            assert_eq!(default_shader_format(depth), Some(shader));
+        }
+        for (srgb, linear) in SRGB {
+            assert_eq!(default_shader_format(srgb), Some(srgb));
+            assert_eq!(default_shader_format(linear), Some(linear));
+        }
+        assert_eq!(default_shader_format(28), Some(28));
+        assert_eq!(default_shader_format(94), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packed_target_selection_requires_all_typed_capabilities() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        let support1 = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0
+            | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+        let support2 =
+            D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD.0 | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0;
+        assert!(packed_target_supported(support1, support2));
+        for missing in [
+            D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0,
+            D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0,
+        ] {
+            assert!(!packed_target_supported(support1 & !missing, support2));
+        }
+        for missing in [
+            D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD.0,
+            D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0,
+        ] {
+            assert!(!packed_target_supported(support1, support2 & !missing));
+        }
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        for format in [86, 115] {
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: DXGI_FORMAT(format),
+                ..Default::default()
+            };
+            let asked = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of_val(&support) as u32,
+                )
+            };
+            assert!(asked.is_ok());
+            let expected = if packed_target_supported(support.Support1.0, support.Support2.0) {
+                format as u32
+            } else {
+                28
+            };
+            assert_eq!(target_format(format as u32), expected);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn srgb_families_have_typeless_resources_and_typed_view_formats() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        for format in [28, 29, 71, 72, 74, 75, 77, 78, 87, 91, 88, 93, 98, 99] {
+            let desc = texture(4, 4, format, 1);
+            let mut resource = null;
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &desc,
+                    0,
+                    null.cast(),
+                    &RESOURCE_IIDS[0],
+                    &mut resource,
+                ),
+                S_OK,
+                "format {format}"
+            );
+            let host = host_resource(resource).unwrap();
+            assert_eq!(unsafe { host.GetDesc() }.Format.0 as u32, family(format));
+            assert_eq!(view_format(resource), Some(format));
+            slot::<Release>(resource, 0x10)(resource);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn srgb_targets_keep_a_clear_value_the_host_takes() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        for format in [28u32, 29] {
+            let mut desc = texture(4, 4, format, 1);
+            desc.flags = 1;
+            let clear = [format, 0, 0, 0, 0];
+            let mut resource = null;
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &desc,
+                    0,
+                    clear.as_ptr().cast(),
+                    &RESOURCE_IIDS[0],
+                    &mut resource,
+                ),
+                S_OK,
+                "format {format}"
+            );
+            let host = host_resource(resource).unwrap();
+            // SAFETY: a live resource.
+            assert_eq!(unsafe { host.GetDesc() }.Format.0 as u32, family(format));
+            slot::<Release>(resource, 0x10)(resource);
+        }
+    }
+
+    #[test]
     fn committed_and_placed_resources_map_at_their_gpu_address() {
         let null = std::ptr::null();
         let mut committed = null;
@@ -3406,5 +4063,33 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn only_sampled_streamed_textures_have_a_texture_budget() {
+        let sampled = texture(64, 64, 28, 1);
+        assert!(fills(&sampled));
+        assert!(host_texture_estimate(&sampled).is_some());
+
+        for flags in [1, 2, 4, 6] {
+            let mut target = sampled;
+            target.flags = flags;
+            assert!(!fills(&target), "flags {flags:#x}");
+            assert!(host_texture_estimate(&target).is_none(), "flags {flags:#x}");
+        }
+
+        let mut one_d = texture(64, 1, 77, 1);
+        one_d.dimension = 2;
+        one_d.height = 1;
+        assert!(
+            matches!(bc3_host(&one_d, false), Bc3Host::Decode(_)),
+            "a 1D block texture needs the decoded stand-in"
+        );
+        let estimate = host_texture_estimate(&one_d).expect("sampled");
+        assert!(
+            estimate >= footprint(&one_d).unwrap().size * 4,
+            "the decoded copy is wider: {estimate}"
+        );
     }
 }

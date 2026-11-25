@@ -177,10 +177,15 @@ fn build(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_fallback: false,
     })?;
     let shader = HostShader {
         stage: HwStage::Cs,
+        profile: lowered.profile,
+        descriptor_aliases: lowered.descriptor_aliases(),
+        direct_heap: lowered.direct_heap,
         dxil: lowered.dxil,
+        mesh_fallback: None,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
         static_samplers: Vec::new(),
@@ -532,14 +537,24 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
+    let mut devices = vec![("hardware", false)];
+    if super::host::warp_enabled() {
+        devices.push(("warp", true));
+    }
+    for (label, warp) in devices {
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(e) => {
+                let profile =
+                    super::resolved_shader_profile().map_or("sm66", |r| r.profile.cache_key());
+                eprintln!("SKIP no {profile} {label} device: {e}");
+                continue;
+            }
         };
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let aliases = host.compute_alias_parameters(&shader);
         for (b, batch) in batches.iter().enumerate() {
             let data = buffer(&scene, batch, pointers);
             let out = host
@@ -548,6 +563,7 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(vec![0; 5]))],
+                        aliases: &aliases,
                         views: &[
                             View::Buffer {
                                 data: &data,
@@ -680,6 +696,7 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_fallback: false,
     });
     match r {
         Err(ShaderError::Unsupported { what, .. }) => {

@@ -84,12 +84,17 @@ mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
-#[cfg(all(test, windows))]
-mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod intersect_tests;
 mod lower;
+mod mesh_fallback;
 mod own_bits;
+mod profile;
+#[cfg(all(test, windows))]
+mod profile_tests;
+pub(super) mod ray;
 mod rect;
 mod sampler;
 mod shader;
@@ -100,22 +105,28 @@ pub mod validator;
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
+mod wave;
 #[cfg(all(test, windows))]
 mod wave64_tests;
-mod wave;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
-pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
+pub use mesh_fallback::MeshFallback;
+pub use profile::{
+    ResolvedShaderProfile, ShaderProfile, ShaderProfileRequest, configure_shader_profile,
+    resolved_shader_profile, set_host_shader_model,
+};
+pub use ray::{RayProfile, bvh_profile, set_auto_bvh_profile};
 pub use rect::rect_list_gs;
+pub use sampler::StaticSampler;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit,
+    DescriptorAlias, DescriptorClass, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE,
+    SLOT_FAULTS, SLOT_MEMORY, SLOT_MESH_OUTPUT, SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE,
+    USER_MEMORY_BASE, USER_MESH_GROUP_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -161,10 +172,16 @@ pub fn loop_limit() -> u32 {
 /// does).
 pub fn group_sync() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_GROUP_SYNC").ok().as_deref().map(str::trim) {
-        Some("0") => 0,
-        Some("1") => 1,
-        _ => 2,
+    *MODE.get_or_init(|| {
+        match std::env::var("VICTORY_GROUP_SYNC")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("0") => 0,
+            Some("1") => 1,
+            _ => 2,
+        }
     })
 }
 
@@ -219,8 +236,21 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
     pub stage: HwStage,
+    /// The shader model the container declares: `Sm65` on a 6.5 device,
+    /// `Sm66` otherwise (hardware mesh programs are always `Sm66`).
+    pub profile: ShaderProfile,
     /// The DXIL container, hashed as D3D12 expects.
     pub dxil: Vec<u8>,
+    /// SM 6.5 only: the descriptor-table aliases of the dynamic heap the
+    /// root signature must declare and bind to the heap's base.
+    pub descriptor_aliases: Vec<shader::DescriptorAlias>,
+    /// The shader makes handles from `ResourceDescriptorHeap[]` or
+    /// `SamplerDescriptorHeap[]` (SM 6.6): its root signature needs the
+    /// direct-heap flags.
+    pub direct_heap: bool,
+    /// For a mesh program translated without mesh-shader hardware: the
+    /// vertex-pulling stage and the byte layout of one emulated group.
+    pub mesh_fallback: Option<MeshFallback>,
     /// The user-data dwords the shader reads.
     pub user_data: Vec<UserData>,
     /// Immediate samplers: the four sampler words of `s<n>`.
@@ -268,9 +298,21 @@ pub struct UserData {
     pub dword: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshTranslation {
+    Hardware,
+    ComputeFallback,
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container.
+/// shader container with hardware mesh shaders where applicable.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_mesh(container, MeshTranslation::Hardware)
+}
+
+/// As [`translate`], choosing how a mesh program is expressed. Other stages
+/// are identical in both modes.
+pub fn translate_mesh(container: &[u8], mode: MeshTranslation) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -294,10 +336,11 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_mode(&c, &native, &p, &st, &io, &res, mode)
 }
 
-/// Emits a program whose earlier stages already ran.
+/// Emits a program whose earlier stages already ran, with hardware mesh
+/// shaders where applicable.
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -306,9 +349,21 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    emit_mode(c, native, p, st, io, res, MeshTranslation::Hardware)
+}
+
+fn emit_mode(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    mode: MeshTranslation,
+) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
-    let original = emit_program(c, native, p, st, io, res);
+    let original = emit_program(c, native, p, st, io, res, mode);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -346,7 +401,9 @@ pub fn emit(
             Ok(()) => true,
             Err((offset, what)) => {
                 if why {
-                    eprintln!("WAVE64-RETRY local waves: not the allocation idiom at {offset:#x}: {what}");
+                    eprintln!(
+                        "WAVE64-RETRY local waves: not the allocation idiom at {offset:#x}: {what}"
+                    );
                 }
                 false
             }
@@ -367,7 +424,7 @@ pub fn emit(
         ];
         for (name, f) in &forms {
             if let Some((p, st, io, res)) = f {
-                let again = emit_program(c, native, p, st, io, res);
+                let again = emit_program(c, native, p, st, io, res, mode);
                 report(name, &again);
                 if done(&again) {
                     return again.map(|(shader, _)| shader);
@@ -390,9 +447,13 @@ pub fn emit(
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
-                let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
+                let deep = if deep_on {
+                    form(ir::without_skips(p, true))
+                } else {
+                    None
+                };
                 if let Some((p, st, io, res)) = &deep {
-                    let again = emit_program(c, native, p, st, io, res);
+                    let again = emit_program(c, native, p, st, io, res, mode);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
                         return again.map(|(shader, _)| shader);
@@ -409,7 +470,7 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why);
+                        let again = widen(c, native, base, why, mode);
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
@@ -427,16 +488,31 @@ pub fn emit(
                 if let Some((p, st, io, res)) = f
                     && idiom(p, st) == exact
                 {
-                    let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
-                    report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
+                    let local =
+                        lower::with_local_waves(|| emit_program(c, native, p, st, io, res, mode));
+                    report(
+                        &format!(
+                            "local waves ({}), {name}",
+                            if exact { "idiom" } else { "APPROXIMATE" }
+                        ),
+                        &local,
+                    );
                     if done(&local) {
                         return local.map(|(shader, _)| shader);
                     }
                 }
             }
             if idiom(p, st) == exact {
-                let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
-                report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
+                let local =
+                    lower::with_local_waves(|| emit_program(c, native, p, st, io, res, mode));
+                report(
+                    if exact {
+                        "local waves (idiom)"
+                    } else {
+                        "local waves (APPROXIMATE)"
+                    },
+                    &local,
+                );
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
                 }
@@ -447,14 +523,20 @@ pub fn emit(
             if !strict {
                 for (name, f) in &forms {
                     if let Some((p, st, io, res)) = f {
-                        let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
-                        report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
+                        let local = lower::with_local_waves_any(|| {
+                            emit_program(c, native, p, st, io, res, mode)
+                        });
+                        report(
+                            &format!("local waves (APPROXIMATE, any mask), {name}"),
+                            &local,
+                        );
                         if done(&local) {
                             return local.map(|(shader, _)| shader);
                         }
                     }
                 }
-                let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
+                let local =
+                    lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res, mode));
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
@@ -471,10 +553,16 @@ pub fn emit(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let again = widen(
+                c,
+                native,
+                p,
+                std::env::var_os("VICTORY_WAVE_WHY").is_some(),
+                mode,
+            );
             match again {
                 Ok(_) => again,
-                Err(_) => emit_program(c, native, p, st, io, res),
+                Err(_) => emit_program(c, native, p, st, io, res, mode),
             }
         }
         other => other,
@@ -493,7 +581,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    emit_program(c, native, &p, &st, &io, &res, mode).map(|(shader, _)| shader)
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -508,6 +596,7 @@ fn widen(
     native: &NativeProgram,
     p: &ir::Program,
     why: bool,
+    mode: MeshTranslation,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
@@ -531,7 +620,7 @@ fn widen(
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
-        let r = emit_program(c, native, p, &st, &io, &res);
+        let r = emit_program(c, native, p, &st, &io, &res, mode);
         let needs = lower::take_needs();
         // (or translated for 64-lane waves still: shared memory read and written where not
         // every lane runs, whose blocks the lowering names too)
@@ -551,7 +640,10 @@ fn widen(
             .collect();
         if more.is_empty() {
             if why {
-                eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
+                eprintln!(
+                    "WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be",
+                    wide.len()
+                );
             }
             return r;
         }
@@ -567,6 +659,7 @@ fn emit_program(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+    mode: MeshTranslation,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -625,21 +718,37 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
-        native,
-        p,
-        st,
-        io,
-        res,
-        inputs,
-        outputs,
-        prims,
-        mesh_stride,
-    })?;
+    let profile = if native.stage == HwStage::Ms && mode == MeshTranslation::Hardware {
+        lower::mesh_profile()
+    } else {
+        match resolved_shader_profile() {
+            Ok(resolved) => resolved.profile,
+            Err(e) => return Err(ShaderError::Profile(e)),
+        }
+    };
+    let l = lower::lower_with_profile(
+        &lower::Parts {
+            native,
+            p,
+            st,
+            io,
+            res,
+            inputs,
+            outputs,
+            prims,
+            mesh_stride,
+            mesh_fallback: mode == MeshTranslation::ComputeFallback && native.stage == HwStage::Ms,
+        },
+        profile,
+    )?;
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
+        profile: l.profile,
+        descriptor_aliases: l.descriptor_aliases(),
+        direct_heap: l.direct_heap,
         dxil: l.dxil,
+        mesh_fallback: l.mesh_fallback,
         user_data: l.user_data,
         static_samplers: l
             .samplers
@@ -989,7 +1098,10 @@ mod tests {
     /// A pixel shader writing a constant colour.
     #[cfg(windows)]
     fn constant_color() -> Vec<u8> {
-        let mut s = Shader::new(true);
+        let profile = super::resolved_shader_profile()
+            .expect("shader profile")
+            .profile;
+        let mut s = Shader::new(true, profile);
         s.outputs.push(SigElement {
             name: "SV_Target".into(),
             index: 0,
@@ -1025,7 +1137,13 @@ mod tests {
         };
         let ps = super::HostShader {
             stage: crate::HwStage::Ps,
+            profile: super::resolved_shader_profile()
+                .expect("shader profile")
+                .profile,
+            descriptor_aliases: Vec::new(),
+            direct_heap: false,
             dxil: constant_color(),
+            mesh_fallback: None,
             user_data: Vec::new(),
             samplers: Vec::new(),
             static_samplers: Vec::new(),
@@ -1037,7 +1155,13 @@ mod tests {
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
                 stage,
+                profile: super::resolved_shader_profile()
+                    .expect("shader profile")
+                    .profile,
+                descriptor_aliases: Vec::new(),
+                direct_heap: false,
                 dxil: std::fs::read(p).unwrap(),
+                mesh_fallback: None,
                 user_data: Vec::new(),
                 samplers: Vec::new(),
                 static_samplers: Vec::new(),
@@ -1141,8 +1265,7 @@ mod tests {
             let c = super::Container::parse(&bytes).unwrap();
             let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
             let st = crate::structure::structure(&p).unwrap();
-            let res =
-                crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = crate::io::raise(&p, &native).unwrap();
             let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
             // dxil.dll, where there is one, checks PSV0 against the module.
@@ -1313,8 +1436,10 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            mesh_fallback: false,
         })
         .unwrap();
+        let descriptor_aliases = l.descriptor_aliases();
         let mut dxil = l.dxil;
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
@@ -1326,7 +1451,11 @@ mod tests {
         if let Ok(host) = super::host::Host::new(false) {
             let cs = super::HostShader {
                 stage: super::HwStage::Cs,
+                profile: l.profile,
+                descriptor_aliases,
+                direct_heap: l.direct_heap,
                 dxil,
+                mesh_fallback: None,
                 user_data: l.user_data,
                 samplers: Vec::new(),
                 static_samplers: Vec::new(),
@@ -1348,6 +1477,7 @@ mod tests {
                     &pso,
                     &super::host::Dispatch {
                         roots: vec![(0, super::host::Root::Constants(vec![0, 0, 0, 0, 0]))],
+                        aliases: &host.compute_alias_parameters(&cs),
                         views: &[
                             super::host::View::Buffer {
                                 data: &inputs,
@@ -1394,6 +1524,7 @@ mod atomic_tests {
 
     #[test]
     fn heap_texture_atomic_widths() {
+        let profile = super::resolved_shader_profile().unwrap().profile;
         // A synthetic compute shader loads a 2D UAV from a root table,
         // compares or adds at (0, 0), then uses the returned register(s).
         for (opcode, mask, wide) in [
@@ -1440,15 +1571,28 @@ mod atomic_tests {
             };
             let p = ir::build(&native.code, false, native.vgprs).unwrap();
             let bytes = crate::dxbc::build(&[]);
-            let shader = emit(
+            let shader = match emit(
                 &Container::parse(&bytes).unwrap(),
                 &native,
                 &p,
                 &structure::structure(&p).unwrap(),
                 &io::raise(&p, &native).unwrap(),
                 &resource::track(&p, &native.layout, native.stage, None).unwrap(),
-            )
-            .unwrap();
+            ) {
+                Ok(shader) => shader,
+                Err(e) => {
+                    assert!(
+                        wide && profile == ShaderProfile::Sm65,
+                        "emission failed for a supported case: {e}"
+                    );
+                    assert!(e.to_string().contains("64-bit image atomic"), "{e}");
+                    continue;
+                }
+            };
+            assert!(
+                !(wide && profile == ShaderProfile::Sm65),
+                "SM 6.5 accepted a 64-bit image atomic"
+            );
             let container = Container::parse(&shader.dxil).unwrap();
             let features = u64::from_le_bytes(
                 container

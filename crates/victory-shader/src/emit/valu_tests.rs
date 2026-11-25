@@ -168,12 +168,17 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_fallback: false,
     })
     .expect("lower");
 
     let shader = HostShader {
         stage: HwStage::Cs,
+        profile: lowered.profile,
+        descriptor_aliases: lowered.descriptor_aliases(),
+        direct_heap: lowered.direct_heap,
         dxil: lowered.dxil,
+        mesh_fallback: None,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
         static_samplers: Vec::new(),
@@ -200,14 +205,19 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
 /// modules take this lock too.
 pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
-/// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
+/// Runs `shader` on every available host of its profile (hardware GPU and,
+/// unless `VICTORY_WARP=0`, WARP) for each 4-dword input set and invokes
+/// `check(backend, case_index, inputs, result_dword)`.
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
     check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
-    run_cases_on(shader, cases, &[("hardware", false), ("warp", true)], check);
+    let mut devices: Vec<(&str, bool)> = vec![("hardware", false)];
+    if super::host::warp_enabled() {
+        devices.push(("warp", true));
+    }
+    run_cases_on(shader, cases, &devices, check);
 }
 
 fn run_cases_on(
@@ -219,13 +229,19 @@ fn run_cases_on(
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for &(label, warp) in devices {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(e) => {
+                let profile =
+                    super::resolved_shader_profile().map_or("sm66", |r| r.profile.cache_key());
+                eprintln!("SKIP no {profile} {label} device: {e}");
+                continue;
+            }
         };
         let (root, pso) = host
             .compute_pipeline(shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let aliases = host.compute_alias_parameters(shader);
         for (i, &inputs) in cases.iter().enumerate() {
             let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
             for u in &shader.user_data {
@@ -241,6 +257,7 @@ fn run_cases_on(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
+                        aliases: &aliases,
                         views: &[View::RawUav(1)],
                         samplers: &[],
                         groups: [1, 1, 1],
@@ -983,7 +1000,10 @@ fn cvt_16bit_int_from_f16_saturates_and_honors_modifiers() {
         (0x7BFF, 65504),  // 65504.0 (max finite f16) -> 65504
         (0x7C00, 0xFFFF), // +inf -> 65535 (saturated)
     ];
-    let u16_in: Vec<[u32; 4]> = u16_cases.iter().map(|&(x, _)| [u32::from(x), 0, 0, 0]).collect();
+    let u16_in: Vec<[u32; 4]> = u16_cases
+        .iter()
+        .map(|&(x, _)| [u32::from(x), 0, 0, 0])
+        .collect();
     run_cases(&cvt_u16, &u16_in, |backend, i, inp, got| {
         let want = u16_cases[i].1;
         assert_eq!(
@@ -1001,15 +1021,18 @@ fn cvt_16bit_int_from_f16_saturates_and_honors_modifiers() {
     );
 
     let i16_cases: &[(u16, u16)] = &[
-        (0xFC00, 0x8000),       // -inf -> -32768
-        (0xF8E2, 0x8000),       // -40000.0 -> -32768 (saturated, not wrapped)
+        (0xFC00, 0x8000),           // -inf -> -32768
+        (0xF8E2, 0x8000),           // -40000.0 -> -32768 (saturated, not wrapped)
         (0xD7BC, (-123i16) as u16), // -123.75 -> -123
-        (0x7E00, 0),            // NaN -> 0
-        (0x57BC, 123),          // 123.75 -> 123
-        (0x78E2, 0x7FFF),       // +40000.0 -> 32767 (saturated, not wrapped)
-        (0x7C00, 0x7FFF),       // +inf -> 32767
+        (0x7E00, 0),                // NaN -> 0
+        (0x57BC, 123),              // 123.75 -> 123
+        (0x78E2, 0x7FFF),           // +40000.0 -> 32767 (saturated, not wrapped)
+        (0x7C00, 0x7FFF),           // +inf -> 32767
     ];
-    let i16_in: Vec<[u32; 4]> = i16_cases.iter().map(|&(x, _)| [u32::from(x), 0, 0, 0]).collect();
+    let i16_in: Vec<[u32; 4]> = i16_cases
+        .iter()
+        .map(|&(x, _)| [u32::from(x), 0, 0, 0])
+        .collect();
     run_cases(&cvt_i16, &i16_in, |backend, i, inp, got| {
         let want = i16_cases[i].1;
         assert_eq!(

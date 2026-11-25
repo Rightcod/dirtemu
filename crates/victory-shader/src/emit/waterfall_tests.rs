@@ -69,6 +69,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_fallback: false,
     })
     .expect("lower");
     // One access with each lane's own heap index, no wave operation.
@@ -76,7 +77,11 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     assert!(!lowered.wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
+        profile: lowered.profile,
+        descriptor_aliases: lowered.descriptor_aliases(),
+        direct_heap: lowered.direct_heap,
         dxil: lowered.dxil,
+        mesh_fallback: None,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
         static_samplers: Vec::new(),
@@ -114,15 +119,25 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
+    let mut devices = vec![("hardware", false)];
+    if super::host::warp_enabled() {
+        devices.push(("warp", true));
+    }
+    for (label, warp) in devices {
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(e) => {
+                let profile =
+                    super::resolved_shader_profile().map_or("sm66", |r| r.profile.cache_key());
+                eprintln!("SKIP no {profile} {label} device: {e}");
+                continue;
+            }
         };
         let (root, pso) = match host.compute_pipeline(shader) {
             Ok(p) => p,
             Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
         };
+        let aliases = host.compute_alias_parameters(shader);
         // Both tables start at heap index 0.
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
@@ -135,6 +150,7 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
                 &pso,
                 &Dispatch {
                     roots: vec![(0, Root::Constants(ud))],
+                    aliases: &aliases,
                     views,
                     samplers: &samplers,
                     groups: [1, 1, 1],

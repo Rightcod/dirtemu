@@ -11,6 +11,9 @@
 /target/
 /tests/fixtures/*/target/
 
+# Local RX 570 investigation / build artifacts
+/.rx570-work/
+
 # Local configuration (contains paths to YOUR files)
 /victory.toml
 

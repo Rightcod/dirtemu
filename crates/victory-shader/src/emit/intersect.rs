@@ -25,6 +25,7 @@
 //! Each lane reads only the dwords its node's kind needs: 28 for a 32-bit
 //! box node, 16 for a 16-bit one, 10 for a triangle.
 
+use super::super::ray::RayProfile;
 use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, Term, V, Why, flags, pred};
 use crate::bvh;
 use crate::resource::BvhNodes;
@@ -37,6 +38,11 @@ thread_local! {
     /// and their directory.)
     pub(in crate::emit) static TEST_MEMORY: std::cell::Cell<Option<(u32, u64)>> =
         const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_BVH_REAL_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Where the instruction's node is.
@@ -58,9 +64,108 @@ struct Ray {
     inverse: [V; 3],
 }
 
+struct BvhInst {
+    dst: u8,
+    site: (usize, usize),
+    rsrc: Operand,
+    nodes: BvhNodes,
+    sort: bool,
+    guard: Option<V>,
+    pointer: V,
+    pointer_high: Option<V>,
+    ray: Ray,
+}
+
+const BOX_MISS: [u32; 4] = [bvh::NONE; 4];
+const TRIANGLE_MISS: [u32; 4] = [
+    f32::INFINITY.to_bits(),
+    1.0f32.to_bits(),
+    0.0f32.to_bits(),
+    0.0f32.to_bits(),
+];
+
+#[cfg(test)]
+fn miss_words(pointer: u32) -> [u32; 4] {
+    if pointer & 6 == 4 {
+        BOX_MISS
+    } else {
+        TRIANGLE_MISS
+    }
+}
+
 impl<'a> Lower<'a> {
     /// `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`.
     pub(super) fn bvh(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        let original_guard = self.guard(b, i)?;
+        match self.bvh_profile {
+            RayProfile::Full => {
+                let parsed = self.bvh_parse(inst, b, i, original_guard)?;
+                let results = self.bvh_real(inst, &parsed)?;
+                self.bvh_write(inst, &parsed, &results);
+                Ok(())
+            }
+            RayProfile::StaticMiss => self.bvh_static_miss(inst, b, i, original_guard),
+            RayProfile::Limited(_) => self.bvh_limited(inst, b, i, original_guard),
+        }
+    }
+
+    pub(super) fn bvh_static_miss(
+        &mut self,
+        inst: &Inst,
+        b: usize,
+        i: usize,
+        original_guard: Option<V>,
+    ) -> Result<(), Why> {
+        let parsed = self.bvh_parse(inst, b, i, original_guard)?;
+        let results = self.bvh_miss(&parsed);
+        self.bvh_write(inst, &parsed, &results);
+        Ok(())
+    }
+
+    pub(super) fn bvh_limited(
+        &mut self,
+        inst: &Inst,
+        b: usize,
+        i: usize,
+        original_guard: Option<V>,
+    ) -> Result<(), Why> {
+        #[cfg(test)]
+        {
+            self.bvh_limited_sites += 1;
+        }
+        let parsed = self.bvh_parse(inst, b, i, original_guard)?;
+        let budget = self
+            .bvh_budget
+            .as_ref()
+            .and_then(|budget| budget.current)
+            .ok_or("a limited ray-tracing node test without a budget")?;
+        let outside = self.bvh_miss(&parsed);
+        let c = self.cur;
+        let zero = self.s.m.i32(0);
+        let has_budget = self.s.m.cmp(c, pred::NE, budget, zero);
+        let run = match original_guard {
+            Some(guard) => self.s.m.bin(c, Bin::And, has_budget, guard),
+            None => has_budget,
+        };
+        let gate = self.begin_guarded(Some(run));
+        let inside = self.bvh_real(inst, &parsed)?;
+        let pairs: Vec<(V, V)> = inside.into_iter().zip(outside).collect();
+        let results = self.end_guarded(gate, &pairs);
+        let one = self.s.m.i32(1);
+        let spent = self.s.m.bin(self.cur, Bin::Sub, budget, one);
+        let next = self.s.m.select(self.cur, run, spent, budget);
+        self.bvh_budget.as_mut().expect("limited").current = Some(next);
+        self.bvh_write(inst, &parsed, &results);
+        Ok(())
+    }
+
+    fn bvh_parse(
+        &mut self,
+        inst: &Inst,
+        b: usize,
+        i: usize,
+        original_guard: Option<V>,
+    ) -> Result<BvhInst, Why> {
         let Fields::Image {
             data,
             addr,
@@ -115,7 +220,7 @@ impl<'a> Lower<'a> {
             // dwords; no program of the title asks for it.
             return Err("a ray-tracing structure that returns triangle ids");
         }
-        let guard = self.guard(b, i)?;
+        let guard = original_guard;
         let mut x = Vec::with_capacity(regs.len());
         for &r in &regs {
             let v = inst.read(Reg::V(r)).ok_or("an unread operand")?;
@@ -133,6 +238,24 @@ impl<'a> Lower<'a> {
             direction: [f[4], f[5], f[6]],
             inverse: [f[7], f[8], f[9]],
         };
+        Ok(BvhInst {
+            dst,
+            site,
+            rsrc: *rsrc,
+            nodes,
+            sort,
+            guard,
+            pointer,
+            pointer_high,
+            ray,
+        })
+    }
+
+    fn bvh_real(&mut self, inst: &Inst, parsed: &BvhInst) -> Result<[V; 4], Why> {
+        #[cfg(test)]
+        TEST_BVH_REAL_CALLS.with(|calls| calls.set(calls.get() + 1));
+        let (site, nodes, sort, guard) = (parsed.site, parsed.nodes, parsed.sort, parsed.guard);
+        let (pointer, pointer_high) = (parsed.pointer, parsed.pointer_high);
         let c = self.cur;
         let at = match nodes {
             BvhNodes::Resource => {
@@ -149,7 +272,7 @@ impl<'a> Lower<'a> {
                 NodeAt::Buffer { handle, byte }
             }
             BvhNodes::Memory { .. } => {
-                let Operand::Scalar { code, .. } = *rsrc else {
+                let Operand::Scalar { code, .. } = parsed.rsrc else {
                     return Err("a ray-tracing structure descriptor not in SGPRs");
                 };
                 let mut words = [pointer; 2];
@@ -189,17 +312,17 @@ impl<'a> Lower<'a> {
             .m
             .terminate(leaf_block, Term::CondBr(is_triangle, triangle_block, join));
         self.cur = box_block;
-        let boxes = self.bvh_boxes(at, kind, &ray, sort);
+        let boxes = self.bvh_boxes(at, kind, &parsed.ray, sort);
         let box_end = self.cur;
         self.s.m.terminate(box_end, Term::Br(join));
         self.cur = triangle_block;
-        let triangle = self.bvh_triangle(at, kind, &ray);
+        let triangle = self.bvh_triangle(at, kind, &parsed.ray);
         let triangle_end = self.cur;
         self.s.m.terminate(triangle_end, Term::Br(join));
         self.cur = join;
         // Kinds 6 and 7 (an instance, a procedural primitive): not known
         // what the console returns; the title's programs do not read it.
-        let other = bvh::MISS.map(|f| self.s.m.i32(f.to_bits()));
+        let other = TRIANGLE_MISS.map(|v| self.s.m.i32(v));
         let i32t = self.s.t.i32;
         let mut results = Vec::with_capacity(4);
         for k in 0..4 {
@@ -215,10 +338,25 @@ impl<'a> Lower<'a> {
             results.push((phi, zero));
         }
         let results = self.end_guarded(gate, &results);
+        Ok([results[0], results[1], results[2], results[3]])
+    }
+
+    fn bvh_miss(&mut self, parsed: &BvhInst) -> [V; 4] {
+        let c = self.cur;
+        let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+        let pair = self.s.m.bin(c, Bin::And, parsed.pointer, k6);
+        let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+        let triangle = TRIANGLE_MISS.map(|v| self.s.m.i32(v));
+        std::array::from_fn(|k| {
+            let none = self.s.m.i32(BOX_MISS[k]);
+            self.s.m.select(c, is_box, none, triangle[k])
+        })
+    }
+
+    fn bvh_write(&mut self, inst: &Inst, parsed: &BvhInst, results: &[V]) {
         for (k, &r) in results.iter().enumerate() {
-            self.write(inst, Reg::V(dst + k as u8), r, guard);
+            self.write(inst, Reg::V(parsed.dst + k as u8), r, parsed.guard);
         }
-        Ok(())
     }
 
     /// Title memory at `low`/`high` for a node's bytes: the raw view of the
@@ -373,7 +511,7 @@ impl<'a> Lower<'a> {
         });
         let c = join;
         let (none, infinity, fzero) = (
-            self.s.m.i32(bvh::NONE),
+            self.s.m.i32(BOX_MISS[0]),
             self.s.m.f32(f32::INFINITY.to_bits()),
             self.s.m.f32(0),
         );
@@ -553,5 +691,576 @@ impl<'a> Lower<'a> {
             let f = self.s.m.select(c, hit, out[n], miss[n]);
             self.as_int(f)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{Lowered, Parts, lower, lower_with_profile};
+    use super::{BOX_MISS, TEST_BVH_REAL_CALLS, TRIANGLE_MISS, miss_words};
+    use crate::bvh;
+    use crate::emit::HostShader;
+    use crate::emit::ray::{RayProfile, TEST_BVH_PROFILE};
+    use crate::emit::{SLOT_FAULTS, SLOT_MEMORY};
+    use crate::native::{
+        ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+    };
+    use crate::{io, ir, resource, structure};
+
+    struct TestMode;
+
+    impl TestMode {
+        fn new(profile: RayProfile) -> Self {
+            TEST_BVH_PROFILE.set(Some(profile));
+            TEST_BVH_REAL_CALLS.set(0);
+            Self
+        }
+    }
+
+    impl Drop for TestMode {
+        fn drop(&mut self) {
+            TEST_BVH_PROFILE.set(None);
+            TEST_BVH_REAL_CALLS.set(0);
+        }
+    }
+
+    fn prologue(_wide: bool) -> Vec<u32> {
+        let mut words = vec![
+            0xBE85_0380,
+            0xF408_0202,
+            0xFA00_0000,
+            0xF408_0302,
+            0xFA00_0020,
+            0x3428_0086,
+            0xE038_1000,
+            0x8002_0114,
+            0xE038_1010,
+            0x8002_0514,
+            0xE038_1020,
+            0x8002_0914,
+            0xE030_1030,
+            0x8002_1114,
+        ];
+        for k in 0..4u32 {
+            words.push(0x7E00_0200 | (13 + k) << 17 | (0x81 + k));
+        }
+        words.extend([
+            0xBE98_0380,
+            0xBE99_0B81,
+            0xBE9A_03C1,
+            0xBE9B_03FF,
+            0x8900_03FF,
+        ]);
+        words
+    }
+
+    fn mask(reg: u32) -> [u32; 2] {
+        [0xBE94_037E, 0x7DAA_2280 & !(0xFF << 9) | reg << 9]
+    }
+
+    fn bvh_words(wide: bool, dst: u32) -> [u32; 5] {
+        let first = 0x0006_0001 | dst << 8;
+        if wide {
+            [0xF19C_9F07, first, 0x0504_0302, 0x0908_0706, 0x000C_0B0A]
+        } else {
+            [0xF198_9F07, first, 0x0605_0403, 0x0A09_0807, 0x0000_0C0B]
+        }
+    }
+
+    fn epilogue(words: &mut Vec<u32>, shift: u32, stores: &[(u32, u32)]) {
+        finish(words, shift, stores, true);
+    }
+
+    fn finish(words: &mut Vec<u32>, shift: u32, stores: &[(u32, u32)], restore: bool) {
+        if restore {
+            words.push(0xBEFE_0314);
+        }
+        words.push(0x342A_0080 | shift);
+        for &(dst, offset) in stores {
+            words.push(0xE078_1000 | offset);
+            words.push(0x8003_0000 | dst << 8 | 0x15);
+        }
+        words.push(0xBF81_0000);
+    }
+
+    fn program(wide: bool) -> Vec<u32> {
+        let mut words = prologue(wide);
+        words.extend(mask(17));
+        words.extend(bvh_words(wide, 13));
+        epilogue(&mut words, 4, &[(13, 0)]);
+        words
+    }
+
+    fn program_two(wide: bool) -> Vec<u32> {
+        let mut words = prologue(wide);
+        words.extend(mask(17));
+        words.extend(bvh_words(wide, 13));
+        words.extend(bvh_words(wide, 17));
+        epilogue(&mut words, 5, &[(13, 0), (17, 16)]);
+        words
+    }
+
+    fn program_plain(wide: bool) -> Vec<u32> {
+        let mut words = prologue(wide);
+        words.extend(bvh_words(wide, 13));
+        finish(&mut words, 4, &[(13, 0)], false);
+        words
+    }
+
+    fn program_two_flags(wide: bool) -> Vec<u32> {
+        let mut words = prologue(wide);
+        words.extend([0xE030_1034, 0x8002_1614]);
+        words.extend(mask(17));
+        words.extend(bvh_words(wide, 13));
+        words.push(0xBEFE_0314);
+        words.extend(mask(22));
+        words.extend(bvh_words(wide, 17));
+        epilogue(&mut words, 5, &[(13, 0), (17, 16)]);
+        words
+    }
+
+    fn program_loop(wide: bool) -> Vec<u32> {
+        let mut words = prologue(wide);
+        words.extend(mask(17));
+        words.push(0xBE86_0382);
+        let start = words.len();
+        words.extend(bvh_words(wide, 13));
+        words.push(0x8106_C106);
+        words.push(0xBF02_8006);
+        let branch = words.len();
+        let back = start as isize - (branch as isize + 1);
+        words.push(0xBF85_0000 | u32::from(back as i16 as u16));
+        epilogue(&mut words, 4, &[(13, 0)]);
+        words
+    }
+
+    fn program_critical(wide: bool) -> Vec<u32> {
+        let mut words = prologue(wide);
+        words.extend(mask(17));
+        words.push(0xBF06_0080);
+        let branch = words.len();
+        words.push(0);
+        words.extend(bvh_words(wide, 13));
+        words.push(0xBF82_0000);
+        let join = words.len();
+        words[branch] = 0xBF85_0000 | u32::from((join as isize - (branch as isize + 1)) as u16);
+        words.extend(bvh_words(wide, 17));
+        epilogue(&mut words, 5, &[(13, 0), (17, 16)]);
+        words
+    }
+
+    fn native(words: &[u32]) -> NativeProgram {
+        native_wave(words, false, 32, 22)
+    }
+
+    fn native_wave(words: &[u32], wave64: bool, threads: u32, vgprs: u16) -> NativeProgram {
+        let table = |kind, at| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: at,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        NativeProgram {
+            stage: HwStage::Cs,
+            wave64,
+            vgprs,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![table(ResourceType::Srv, 0), table(ResourceType::Uav, 8)],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [threads, 1, 1],
+            }),
+            code: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+        }
+    }
+
+    fn lower_native_with(
+        native: &NativeProgram,
+        profile: crate::emit::ShaderProfile,
+    ) -> Result<Lowered, crate::ShaderError> {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, native).expect("io::raise");
+        lower_with_profile(
+            &Parts {
+                native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+                mesh_fallback: false,
+            },
+            profile,
+        )
+    }
+
+    fn lower_native(native: &NativeProgram) -> Result<Lowered, crate::ShaderError> {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, native).expect("io::raise");
+        lower(&Parts {
+            native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            mesh_fallback: false,
+        })
+    }
+
+    fn lower_program(wide: bool) -> Result<Lowered, crate::ShaderError> {
+        lower_native(&native(&program(wide)))
+    }
+
+    fn shader_for(
+        native: &NativeProgram,
+        profile: RayProfile,
+    ) -> (HostShader, resource::Resources) {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("tracked");
+        let io = io::raise(&p, native).expect("io::raise");
+        let was = TEST_BVH_PROFILE.replace(Some(profile));
+        let lowered = lower(&Parts {
+            native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            mesh_fallback: false,
+        })
+        .expect("lowers");
+        TEST_BVH_PROFILE.set(was);
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            profile: lowered.profile,
+            descriptor_aliases: lowered.descriptor_aliases(),
+            direct_heap: lowered.direct_heap,
+            dxil: lowered.dxil,
+            mesh_fallback: None,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            root_indexed_views: res.root_indexed_views.clone(),
+        };
+        (shader, res)
+    }
+
+    fn dxil_hash(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, &b| {
+            (hash ^ u64::from(b)).wrapping_mul(0x1000_0000_01b3)
+        })
+    }
+
+    #[cfg(windows)]
+    fn validate(lowered: &Lowered) {
+        if let Ok(mut validator) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            let mut dxil = lowered.dxil.clone();
+            validator
+                .validate(&mut dxil)
+                .expect("DXIL validation failed");
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn validate(_: &Lowered) {}
+
+    #[test]
+    fn deterministic_misses_match_the_current_node_result_abi() {
+        assert_eq!(TRIANGLE_MISS, bvh::MISS.map(f32::to_bits));
+        for kind in 0..8u32 {
+            let expected = if matches!(kind, 4 | 5) {
+                BOX_MISS
+            } else {
+                TRIANGLE_MISS
+            };
+            assert_eq!(miss_words(0x1234_5000 | kind), expected, "kind {kind}");
+            assert_eq!(miss_words(0xFEDC_BA80 | kind), expected, "kind {kind}");
+        }
+    }
+
+    #[test]
+    fn static_miss_lowering_never_enters_the_real_node_or_fault_paths() {
+        for wide in [false, true] {
+            TEST_BVH_REAL_CALLS.set(0);
+            let full = lower_program(wide).expect("full lowering");
+            assert_eq!(TEST_BVH_REAL_CALLS.get(), 1);
+            assert!(full.root_srvs.contains(&SLOT_MEMORY));
+            assert!(full.root_uavs.contains(&SLOT_FAULTS));
+            let mode = TestMode::new(RayProfile::StaticMiss);
+            let static_miss = lower_program(wide).expect("static-miss lowering");
+            validate(&static_miss);
+            assert_eq!(TEST_BVH_REAL_CALLS.get(), 0, "wide {wide}");
+            assert!(!static_miss.root_srvs.contains(&SLOT_MEMORY), "wide {wide}");
+            assert!(!static_miss.root_uavs.contains(&SLOT_FAULTS), "wide {wide}");
+            drop(mode);
+        }
+    }
+
+    #[cfg(windows)]
+    fn run_two_on_card(
+        words: &[u32],
+        profile: RayProfile,
+        flags: &[(u32, u32)],
+    ) -> Option<(Vec<u32>, [u32; 4])> {
+        use crate::emit::host::{Dispatch, Host, Root, Stride, View};
+        let _one = crate::emit::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        const THREADS: usize = 32;
+        const RECORD: usize = 16;
+        let ray = bvh::Ray::new([-10.0, 0.0, 0.0], [1.0, 0.0, 0.0], 100.0);
+        let boxes = [[-1.0f32, -1.0, -1.0, 1.0, 1.0, 1.0]; 4];
+        let node = bvh::tests::box32([0x1005, 0x2005, 0x3005, 0x4005], boxes);
+        let expected = bvh::intersect(&node, 5, &ray, true);
+        let mut data = vec![0u32; THREADS * RECORD + 28];
+        let pointer = ((THREADS * 64) as u32 >> 3) | 5;
+        for t in 0..THREADS {
+            let r = &mut data[t * RECORD..][..RECORD];
+            r[0] = pointer;
+            r[2] = ray.extent.to_bits();
+            for a in 0..3 {
+                r[3 + a] = ray.origin[a].to_bits();
+                r[6 + a] = ray.direction[a].to_bits();
+                r[9 + a] = ray.inverse[a].to_bits();
+            }
+            (r[12], r[13]) = flags.get(t).copied().unwrap_or((0, 0));
+        }
+        data[THREADS * RECORD..].copy_from_slice(&node);
+        let native = native_wave(words, false, THREADS as u32, 23);
+        let (shader, _) = shader_for(&native, profile);
+        let host = match Host::new(false) {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("SKIP no hardware device: {e}");
+                return None;
+            }
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
+        let aliases = host.compute_alias_parameters(&shader);
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0; 5]))],
+                    aliases: &aliases,
+                    views: &[
+                        View::Buffer {
+                            data: &data,
+                            stride: Stride::Raw,
+                        },
+                        View::RawUav(8 * THREADS as u32),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        Some((out.into_iter().next().expect("a UAV"), expected))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn limited_budget_exhausts_after_exactly_n_tests_on_the_card() {
+        let flags = [(1, 1); 32];
+        let Some((out, expected)) =
+            run_two_on_card(&program_two(false), RayProfile::Limited(1), &flags)
+        else {
+            return;
+        };
+        for t in 0..32 {
+            assert_eq!(&out[8 * t..8 * t + 4], &expected, "thread {t} first");
+            assert_eq!(&out[8 * t + 4..8 * t + 8], &BOX_MISS, "thread {t} second");
+        }
+        for (profile, second) in [
+            (RayProfile::Limited(2), expected),
+            (RayProfile::Full, expected),
+            (RayProfile::StaticMiss, BOX_MISS),
+        ] {
+            let Some((out, expected)) = run_two_on_card(&program_two(false), profile, &flags)
+            else {
+                return;
+            };
+            let first = if profile == RayProfile::StaticMiss {
+                BOX_MISS
+            } else {
+                expected
+            };
+            for t in 0..32 {
+                assert_eq!(
+                    &out[8 * t..8 * t + 4],
+                    &first,
+                    "{profile:?} thread {t} first"
+                );
+                assert_eq!(
+                    &out[8 * t + 4..8 * t + 8],
+                    &second,
+                    "{profile:?} thread {t} second"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_predicated_off_test_does_not_spend_the_budget_on_the_card() {
+        let flags = [(0, 1); 32];
+        let Some((out, expected)) =
+            run_two_on_card(&program_two_flags(false), RayProfile::Limited(1), &flags)
+        else {
+            return;
+        };
+        for t in 0..32 {
+            assert_eq!(&out[8 * t..8 * t + 4], &[1, 2, 3, 4], "thread {t} first");
+            assert_eq!(
+                &out[8 * t + 4..8 * t + 8],
+                &expected,
+                "thread {t} second keeps the budget"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn limited_budget_bounds_a_loop_on_the_card() {
+        let flags = [(1, 1); 32];
+        let Some((out, _)) = run_two_on_card(&program_loop(false), RayProfile::Limited(1), &flags)
+        else {
+            return;
+        };
+        for t in 0..32 {
+            assert_eq!(&out[4 * t..4 * t + 4], &BOX_MISS, "thread {t}");
+        }
+        let Some((out, expected)) =
+            run_two_on_card(&program_loop(false), RayProfile::Limited(2), &flags)
+        else {
+            return;
+        };
+        for t in 0..32 {
+            assert_eq!(&out[4 * t..4 * t + 4], &expected, "thread {t}");
+        }
+    }
+
+    #[test]
+    fn full_profile_dxil_is_unchanged() {
+        let _mode = TestMode::new(RayProfile::Full);
+        for (wide, len, hash) in [
+            (false, 6668, 0x26f8_7f80_b6b1_e72c),
+            (true, 6692, 0x09f7_3bdc_1831_ccfd),
+        ] {
+            let lowered =
+                lower_native_with(&native(&program(wide)), crate::emit::ShaderProfile::Sm66)
+                    .expect("full lowering");
+            validate(&lowered);
+            assert_eq!(lowered.dxil.len(), len, "wide {wide}");
+            assert_eq!(dxil_hash(&lowered.dxil), hash, "wide {wide}");
+            assert!(lowered.bvh_budget_phi_blocks.is_empty());
+            assert!(lowered.bvh_budget_edges.is_empty());
+            assert_eq!(lowered.bvh_limited_sites, 0);
+        }
+    }
+
+    #[test]
+    fn limited_profile_has_a_phi_at_each_reachable_block_entry() {
+        for (wave64, threads, words) in
+            [(false, 32, program(false)), (true, 64, program_plain(true))]
+        {
+            let _mode = TestMode::new(RayProfile::Limited(4));
+            let native = native_wave(&words, wave64, threads, 22);
+            let lowered = lower_native(&native).expect("limited lowering");
+            validate(&lowered);
+            let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+            let order = ir::reverse_postorder(&p.blocks);
+            let mut got = lowered.bvh_budget_phi_blocks.clone();
+            got.sort_unstable();
+            let mut want = order[1..].to_vec();
+            want.sort_unstable();
+            assert_eq!(got, want, "wave64={wave64}");
+            assert_eq!(lowered.bvh_limited_sites, 1);
+        }
+    }
+
+    #[test]
+    fn limited_profile_lowers_sequential_calls_on_one_budget() {
+        let _mode = TestMode::new(RayProfile::Limited(1));
+        let lowered = lower_native(&native(&program_two(false))).expect("limited lowering");
+        validate(&lowered);
+        assert_eq!(lowered.bvh_limited_sites, 2);
+        assert!(lowered.bvh_budget_phi_blocks.is_empty());
+    }
+
+    #[test]
+    fn limited_profile_carries_a_loop_header_phi_from_the_back_edge_latch() {
+        let _mode = TestMode::new(RayProfile::Limited(1));
+        let lowered = lower_native(&native(&program_loop(false))).expect("limited loop");
+        validate(&lowered);
+        assert_eq!(lowered.bvh_limited_sites, 1);
+        let back = lowered
+            .bvh_budget_edges
+            .iter()
+            .find(|edge| edge.back)
+            .expect("a back edge");
+        assert!(
+            lowered
+                .bvh_budget_edges
+                .iter()
+                .any(|edge| edge.to == back.to && !edge.back),
+            "the header phis take a forward entry too"
+        );
+    }
+
+    #[test]
+    fn limited_profile_splits_a_critical_edge_to_a_budget_phi() {
+        let _mode = TestMode::new(RayProfile::Limited(1));
+        let lowered = lower_native(&native(&program_critical(false))).expect("critical edge");
+        validate(&lowered);
+        assert_eq!(lowered.bvh_limited_sites, 2);
+        let critical = lowered
+            .bvh_budget_edges
+            .iter()
+            .find(|edge| edge.critical)
+            .unwrap_or_else(|| panic!("{:?}", lowered.bvh_budget_edges));
+        assert_ne!(critical.pred, critical.to);
     }
 }

@@ -614,6 +614,79 @@ impl Layout {
         })
     }
 
+    pub fn decode_bc3(
+        &self,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        rgba: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        if self.desc.block != 4 || self.desc.element_bytes != 16 {
+            return Err(Error::Invalid);
+        }
+        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let first = if self.desc.dimension == Dimension::Tex3d {
+            if slice != 0 {
+                return Err(Error::Invalid);
+            }
+            0
+        } else {
+            slice
+        };
+        if first >= self.slices {
+            return Err(Error::Invalid);
+        }
+        if !self.addressable() {
+            return Err(Error::Unsupported);
+        }
+        let width = (self.desc.width >> mip).max(1) as usize;
+        let height = (self.desc.height >> mip).max(1) as usize;
+        let row_bytes = width * crate::bc::RGBA_BYTES;
+        let need = (m.depth as usize - 1)
+            .checked_mul(depth_pitch)
+            .zip((height - 1).checked_mul(row_pitch))
+            .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
+            .and_then(|offset| offset.checked_add(row_bytes))
+            .ok_or(Error::TooSmall)?;
+        if tiled.len() < self.size as usize || rgba.len() < need || row_pitch < row_bytes {
+            return Err(Error::TooSmall);
+        }
+        for z in 0..m.depth {
+            for by in 0..m.height {
+                for bx in 0..m.width {
+                    let at = self.offset(mip, bx, by, first + z)? as usize;
+                    let block: &[u8; crate::bc::BLOCK_BYTES] = tiled
+                        .get(at..at + crate::bc::BLOCK_BYTES)
+                        .and_then(|b| b.try_into().ok())
+                        .ok_or(Error::TooSmall)?;
+                    let pixels = crate::bc::decode_bc3_block(block);
+                    let x0 = bx as usize * crate::bc::BLOCK_TEXELS as usize;
+                    let y0 = by as usize * crate::bc::BLOCK_TEXELS as usize;
+                    for py in 0..crate::bc::BLOCK_TEXELS as usize {
+                        let y = y0 + py;
+                        if y >= height {
+                            break;
+                        }
+                        let row = z as usize * depth_pitch + y * row_pitch;
+                        for px in 0..crate::bc::BLOCK_TEXELS as usize {
+                            let x = x0 + px;
+                            if x >= width {
+                                break;
+                            }
+                            let source = (py * 4 + px) * crate::bc::RGBA_BYTES;
+                            let target = row + x * crate::bc::RGBA_BYTES;
+                            rgba[target..target + crate::bc::RGBA_BYTES]
+                                .copy_from_slice(&pixels[source..source + crate::bc::RGBA_BYTES]);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
     #[allow(clippy::too_many_arguments)]
     fn walk(
@@ -1063,6 +1136,107 @@ mod tests {
             layout.detile(&tiled, 0, 0, &mut linear, 16, usize::MAX),
             Err(Error::TooSmall)
         );
+    }
+
+    fn constant_bc3_block(colour: u16) -> [u8; 16] {
+        let mut block = [0u8; 16];
+        block[0] = 255;
+        block[1] = 255;
+        block[8..10].copy_from_slice(&colour.to_le_bytes());
+        block[10..12].copy_from_slice(&colour.to_le_bytes());
+        block
+    }
+
+    fn expanded(colour: u16) -> [u8; 4] {
+        let r = ((colour >> 11) & 0x1f) as u8;
+        let g = ((colour >> 5) & 0x3f) as u8;
+        let b = (colour & 0x1f) as u8;
+        [
+            (r << 3) | (r >> 2),
+            (g << 2) | (g >> 4),
+            (b << 3) | (b >> 2),
+            255,
+        ]
+    }
+
+    #[test]
+    fn bc3_decode_keeps_logical_extents_and_mips() {
+        for swizzle in [Swizzle::SW_4KB_S, Swizzle::LINEAR] {
+            let d = Desc {
+                block: 4,
+                ..desc(9, 7, 4, 16, swizzle)
+            };
+            let l = Layout::new(&d).unwrap();
+            let mut tiled = vec![0u8; l.size as usize];
+            for mip in 0..d.mips {
+                let m = l.mips[mip as usize];
+                let width = (d.width >> mip).max(1);
+                let height = (d.height >> mip).max(1);
+                for by in 0..m.height {
+                    for bx in 0..m.width {
+                        let colour = 0x8000 | ((mip * 0x100 + by * 0x10 + bx) as u16 & 0x7fff);
+                        let at = l.offset(mip, bx, by, 0).unwrap() as usize;
+                        tiled[at..at + 16].copy_from_slice(&constant_bc3_block(colour));
+                    }
+                }
+                let row_pitch = width as usize * 4 + 7;
+                let depth_pitch = row_pitch * height as usize;
+                let mut rgba = vec![0xccu8; depth_pitch];
+                l.decode_bc3(&tiled, mip, 0, &mut rgba, row_pitch, depth_pitch)
+                    .unwrap();
+                for y in 0..height as usize {
+                    for x in 0..width as usize {
+                        let at = y * row_pitch + x * 4;
+                        let block_x = x as u32 / 4;
+                        let block_y = y as u32 / 4;
+                        let colour =
+                            0x8000 | ((mip * 0x100 + block_y * 0x10 + block_x) as u16 & 0x7fff);
+                        assert_eq!(
+                            rgba[at..at + 4],
+                            expanded(colour),
+                            "{swizzle:?} {mip} {x} {y}"
+                        );
+                    }
+                    let end = y * row_pitch + width as usize * 4;
+                    assert!(rgba[end..(y + 1) * row_pitch].iter().all(|&b| b == 0xcc));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bc3_decode_reads_array_slices() {
+        let d = Desc {
+            block: 4,
+            depth: 3,
+            ..desc(6, 5, 1, 16, Swizzle::SW_4KB_S)
+        };
+        let l = Layout::new(&d).unwrap();
+        let mut tiled = vec![0u8; l.size as usize];
+        for slice in 0..3u32 {
+            for by in 0..l.mips[0].height {
+                for bx in 0..l.mips[0].width {
+                    let colour = 0x8000 | ((slice * 0x100 + by * 0x10 + bx) as u16 & 0x7fff);
+                    let at = l.offset(0, bx, by, slice).unwrap() as usize;
+                    tiled[at..at + 16].copy_from_slice(&constant_bc3_block(colour));
+                }
+            }
+        }
+        for slice in 0..3u32 {
+            let row_pitch = 6 * 4;
+            let mut rgba = vec![0xccu8; row_pitch * 5];
+            l.decode_bc3(&tiled, 0, slice, &mut rgba, row_pitch, row_pitch * 5)
+                .unwrap();
+            for y in 0..5usize {
+                for x in 0..6usize {
+                    let colour = 0x8000
+                        | ((slice * 0x100 + (y as u32 / 4) * 0x10 + (x as u32 / 4)) as u16
+                            & 0x7fff);
+                    let at = y * row_pitch + x * 4;
+                    assert_eq!(rgba[at..at + 4], expanded(colour), "{slice} {x} {y}");
+                }
+            }
+        }
     }
 
     #[test]

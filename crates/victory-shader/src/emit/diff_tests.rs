@@ -764,6 +764,7 @@ fn translated_shaders_draw_as_pc_ones() {
     let textures: [(u32, u32, &[[f32; 4]]); 2] = [(1, 1, &dummy), (4, 4, &texels)];
     let draw = |roots| Draw {
         roots,
+        aliases: &[],
         textures: &textures,
         samplers: &samplers,
         vertices: &vertices,
@@ -805,16 +806,13 @@ fn translated_shaders_draw_as_pc_ones() {
             }
         }
         let (root_t, pso_t) = host.pipeline(&vs_c, &ps_c).unwrap();
-        let ours = host
-            .draw(
-                &root_t,
-                &pso_t,
-                &draw(vec![
-                    (0, Root::Constants(user_data(&vs_c, &k))),
-                    (1, Root::Constants(user_data(&ps_c, &k))),
-                ]),
-            )
-            .unwrap();
+        let aliases = host.graphics_alias_parameters(&vs_c, &ps_c);
+        let mut d = draw(vec![
+            (0, Root::Constants(user_data(&vs_c, &k))),
+            (1, Root::Constants(user_data(&ps_c, &k))),
+        ]);
+        d.aliases = &aliases;
+        let ours = host.draw(&root_t, &pso_t, &d).unwrap();
 
         let (vs_p, ps_p) = (
             compile(&pc, &dir, src, vs, "vs_6_5"),
@@ -883,6 +881,7 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
     let k = [0.75f32, -1.5, 2.0, 0.125].map(f32::to_bits);
     let draw = |roots, mesh_groups| Draw {
         roots,
+        aliases: &[],
         textures: &[],
         samplers: &[],
         vertices: &[],
@@ -1028,6 +1027,7 @@ fn float_semantics_are_the_consoles() {
             &pso,
             &Dispatch {
                 roots: vec![(0, Root::Constants(user_data(&cs, &k)))],
+                aliases: &host.compute_alias_parameters(&cs),
                 views: &views,
                 samplers: &[],
                 groups: [1, 1, 1],
@@ -1168,6 +1168,7 @@ fn translated_compute_matches_pc() {
     }; 2];
     let dispatch = |roots| Dispatch {
         roots,
+        aliases: &[],
         views: &views,
         samplers: &samplers,
         groups: [2, 2, 1],
@@ -1225,7 +1226,10 @@ fn translated_compute_matches_pc() {
             };
             roots.push((1 + n as u32, Root::View { srv, data }));
         }
-        let ours = host.dispatch(&root_t, &pso_t, &dispatch(roots));
+        let aliases = host.compute_alias_parameters(&cs_c);
+        let mut d = dispatch(roots);
+        d.aliases = &aliases;
+        let ours = host.dispatch(&root_t, &pso_t, &d);
         if name.starts_with("terminates") {
             match ours {
                 Ok(_) => eprintln!("{name}: finished"),

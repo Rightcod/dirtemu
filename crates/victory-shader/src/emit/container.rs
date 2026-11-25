@@ -139,6 +139,8 @@ pub(crate) struct Binding {
     pub kind: u32,
     pub space: u32,
     pub register: u32,
+    /// Last register of the range (`u32::MAX` for an unbounded range).
+    pub upper: u32,
     /// DXIL resource kind (13 cbuffer, 14 sampler).
     pub dxil_kind: u32,
 }
@@ -163,8 +165,11 @@ pub(crate) struct Psv<'a> {
     pub wave_size: Option<u32>,
 }
 
-/// `PSV0` with runtime info version 2 (validator 1.6).
-pub(crate) fn psv(p: &Psv) -> Vec<u8> {
+/// `PSV0` with runtime info version 2 (validator 1.6) or version 1
+/// (validator 1.5: a 36-byte `PSVRuntimeInfo1` and 16-byte bind records).
+pub(crate) fn psv(p: &Psv, profile: super::ShaderProfile) -> Vec<u8> {
+    let v2 = profile == super::ShaderProfile::Sm66;
+    let info_size = if v2 { 48usize } else { 36 };
     let vectors = |els: &[SigElement]| {
         els.iter()
             .filter_map(|e| e.row)
@@ -179,7 +184,7 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             out.extend(v.to_le_bytes());
         }
     };
-    u32s(&mut out, &[48]);
+    u32s(&mut out, &[info_size as u32]);
     let mut info = [0u8; 48];
     info[0] = u8::from(p.flag);
     if p.stage == 0 {
@@ -219,15 +224,22 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[12] = u8::from(p.flag);
         info[26..28].copy_from_slice(&(max_vertices as u16).to_le_bytes());
     }
-    out.extend(info);
+    out.extend(&info[..info_size]);
     u32s(&mut out, &[p.bindings.len() as u32]);
     if !p.bindings.is_empty() {
-        u32s(&mut out, &[24]);
-        for b in p.bindings {
-            u32s(
-                &mut out,
-                &[b.kind, b.space, b.register, b.register, b.dxil_kind, 0],
-            );
+        if v2 {
+            u32s(&mut out, &[24]);
+            for b in p.bindings {
+                u32s(
+                    &mut out,
+                    &[b.kind, b.space, b.register, b.upper, b.dxil_kind, 0],
+                );
+            }
+        } else {
+            u32s(&mut out, &[16]);
+            for b in p.bindings {
+                u32s(&mut out, &[b.kind, b.space, b.register, b.upper]);
+            }
         }
     }
     // Names of arbitrary semantics (system values use ""), then indices.

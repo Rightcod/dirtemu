@@ -35,4 +35,7 @@ pub enum ShaderError {
     /// Valid code the translator cannot handle yet: an opcode name or a construct.
     #[error("GFX10 code at {offset:#x}: {what} is not supported")]
     Unsupported { offset: usize, what: &'static str },
+    /// The requested or the device's shader profile is unusable.
+    #[error("shader profile: {0}")]
+    Profile(String),
 }

@@ -3,12 +3,15 @@
 //! signature of our own that the translated shaders' bindings define
 //! (`victory_shader::emit`): per stage one block of root constants for the
 //! user data, root views for the title's root views, static samplers for
-//! the immediate samplers, and directly indexed heaps.
+//! the immediate samplers, and either the SM 6.5 descriptor-table aliases
+//! of the dynamic heap or the SM 6.6 directly indexed heaps.
 
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{
+    DescriptorAlias, DescriptorClass, HostShader, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
+};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -165,9 +168,8 @@ impl GraphicsState {
                 15 => {
                     self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
                     for f in &mut self.targets.RTFormats {
-                        f.0 = crate::resource::target_format(crate::resource::pc_format(
-                            f.0 as u32,
-                        )) as i32;
+                        f.0 = crate::resource::target_format(crate::resource::pc_format(f.0 as u32))
+                            as i32;
                     }
                 }
                 16 => {
@@ -190,7 +192,12 @@ impl GraphicsState {
             .map(|(e, name)| {
                 format!(
                     "{name:?} {} {} {} {} {} {}",
-                    e.SemanticIndex, e.Format.0, e.InputSlot, e.AlignedByteOffset, e.InputSlotClass.0, e.InstanceDataStepRate
+                    e.SemanticIndex,
+                    e.Format.0,
+                    e.InputSlot,
+                    e.AlignedByteOffset,
+                    e.InputSlotClass.0,
+                    e.InstanceDataStepRate
                 )
             })
             .collect();
@@ -276,6 +283,9 @@ pub(crate) struct Stage {
     /// Root UAVs: one-view tables like the SRVs (or root descriptors with
     /// `VICTORY_ROOT_SRV_DIRECT=1`).
     pub(crate) root_uavs: Vec<(u8, u32)>,
+    /// SM 6.5 descriptor aliases: the root parameter of each, and whether
+    /// it is the sampler heap. Each is bound to the base of its heap.
+    pub(crate) aliases: Vec<(u32, bool)>,
 }
 
 impl Stage {
@@ -286,11 +296,41 @@ impl Stage {
     }
 }
 
+pub(crate) struct MeshFallbackPipeline {
+    pub(crate) compute: ID3D12PipelineState,
+    pub(crate) compute_root: ID3D12RootSignature,
+    pub(crate) output_uav: u32,
+    pub(crate) output_srv: u32,
+    pub(crate) group_bytes: u32,
+    pub(crate) max_primitives: u32,
+}
+
+fn mesh_fallback_max_primitives(
+    max_primitives: u32,
+    max_vertices: u32,
+    vertex_stride: u32,
+    primitive_stride: u32,
+    group_bytes: u32,
+) -> Option<u32> {
+    const DRAW_ARGUMENTS: u32 = 16;
+    const INDEX_BYTES: u32 = 12;
+    if max_primitives > crate::mesh_fallback::MAX_PRIMITIVES {
+        return None;
+    }
+    let index_end = DRAW_ARGUMENTS.checked_add(INDEX_BYTES.checked_mul(max_primitives)?)?;
+    let vertex_base = index_end.checked_add(15)? & !15;
+    let vertex_end = vertex_base.checked_add(vertex_stride.checked_mul(max_vertices)?)?;
+    let record_end = vertex_end.checked_add(primitive_stride.checked_mul(max_primitives)?)?;
+    let least = record_end.checked_add(15)? & !15;
+    (group_bytes >= least).then_some(max_primitives)
+}
+
 pub(crate) struct HostPipeline {
     /// A compute pipeline (else graphics).
     pub(crate) compute: bool,
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
+    pub(crate) mesh_fallback: Option<MeshFallbackPipeline>,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
@@ -344,10 +384,12 @@ impl HostPipeline {
             );
         }
         let mesh = find("mesh");
+        let fallback = mesh.is_some() && crate::mesh_fallback::enabled();
         let stages = if let Some(cs) = compute {
             vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
         } else {
             let first = match (mesh, find("vertex")) {
+                (Some(ms), _) if fallback => (ms, D3D12_SHADER_VISIBILITY_ALL),
                 (Some(ms), _) => (ms, D3D12_SHADER_VISIBILITY_MESH),
                 (None, Some(vs)) => (vs, D3D12_SHADER_VISIBILITY_VERTEX),
                 (None, None) => return refuse("no vertex or mesh shader", shaders),
@@ -356,144 +398,83 @@ impl HostPipeline {
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             stages
         };
-        if mesh.is_some() && !host()?.mesh_shaders() {
-            return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
+        // The host device exists (and has fixed the shader profile) before
+        // any shader is translated: a translation, and its disk-cache key,
+        // must see the device's effective profile.
+        let host = host()?;
+        if mesh.is_some() && !fallback && !host.mesh_shaders() {
+            return refuse(
+                "the host GPU has no mesh shaders (or no shader model 6.6)",
+                shaders,
+            );
         }
         for (s, _) in &stages {
             s.translated()?;
         }
-        let host = host()?;
 
-        // The root signature the translated shaders' bindings define.
-        let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
-        // The ranges table parameters point at, alive until the root
-        // signature is made.
-        let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
-        let mut samplers = Vec::new();
-        let mut bound = Vec::new();
-        for &(shader, visibility) in &stages {
-            let t = &shader.translated()?.host;
-            let mut stage = Stage {
-                shader: shader.clone(),
-                user_data: None,
-                root_cbvs: Vec::new(),
-                root_srvs: Vec::new(),
-                root_uavs: Vec::new(),
-            };
-            let dwords = t.user_data_dwords();
-            if dwords > 0 {
-                stage.user_data = Some((params.len() as u32, dwords));
-                params.push(D3D12_ROOT_PARAMETER1 {
-                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                        Constants: D3D12_ROOT_CONSTANTS {
-                            ShaderRegister: 0,
-                            RegisterSpace: USER_DATA_SPACE,
-                            Num32BitValues: dwords,
-                        },
-                    },
-                    ShaderVisibility: visibility,
-                });
+        let layout = |selected: &[(&Arc<Shader>, D3D12_SHADER_VISIBILITY)],
+                      output: Option<(D3D12_ROOT_PARAMETER_TYPE, D3D12_SHADER_VISIBILITY)>,
+                      compute: bool| {
+            let mut translated: Vec<(&HostShader, D3D12_SHADER_VISIBILITY)> =
+                Vec::with_capacity(selected.len());
+            for &(shader, visibility) in selected {
+                translated.push((&shader.translated()?.host, visibility));
             }
-            for (slots, kind, out) in [
-                (
-                    &t.root_cbvs,
-                    D3D12_ROOT_PARAMETER_TYPE_CBV,
-                    &mut stage.root_cbvs,
-                ),
-                (
-                    &t.root_srvs,
-                    D3D12_ROOT_PARAMETER_TYPE_SRV,
-                    &mut stage.root_srvs,
-                ),
-                (
-                    &t.root_uavs,
-                    D3D12_ROOT_PARAMETER_TYPE_UAV,
-                    &mut stage.root_uavs,
-                ),
-            ] {
-                for &slot in slots {
-                    let uav = kind == D3D12_ROOT_PARAMETER_TYPE_UAV;
-                    // Ours, not the title's, stay root descriptors: the
-                    // table of strides, the directory of title memory by
-                    // address and its fault notes.
-                    let ours = if uav {
-                        slot == victory_shader::emit::SLOT_FAULTS
-                    } else {
-                        slot == victory_shader::emit::SLOT_STRIDES
-                            || slot == victory_shader::emit::SLOT_MEMORY
-                    };
-                    if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
-                        // A one-view table: the view's size bounds the
-                        // reads (and a root UAV's writes), which a root
-                        // descriptor leaves unbounded.
-                        // (Our own table of strides stays a descriptor.)
-                        ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
-                            RangeType: if uav {
-                                D3D12_DESCRIPTOR_RANGE_TYPE_UAV
-                            } else {
-                                D3D12_DESCRIPTOR_RANGE_TYPE_SRV
-                            },
-                            NumDescriptors: 1,
-                            BaseShaderRegister: u32::from(slot),
-                            RegisterSpace: ROOT_CBV_SPACE,
-                            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
-                                | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
-                            OffsetInDescriptorsFromTableStart: 0,
-                        }));
-                        let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
-                        out.push((slot, params.len() as u32));
-                        params.push(D3D12_ROOT_PARAMETER1 {
-                            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-                            Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
-                                    NumDescriptorRanges: 1,
-                                    pDescriptorRanges: range,
-                                },
-                            },
-                            ShaderVisibility: visibility,
-                        });
-                        continue;
-                    }
-                    out.push((slot, params.len() as u32));
-                    params.push(D3D12_ROOT_PARAMETER1 {
-                        ParameterType: kind,
-                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                                ShaderRegister: u32::from(slot),
-                                RegisterSpace: ROOT_CBV_SPACE,
-                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
-                            },
-                        },
-                        ShaderVisibility: visibility,
-                    });
+            match signature_layout(&host.device, &translated, output, compute, fallback) {
+                Ok(signature) => {
+                    let Signature {
+                        root,
+                        blob,
+                        stages: layouts,
+                        output,
+                    } = signature;
+                    let bound: Vec<Stage> = selected
+                        .iter()
+                        .zip(layouts)
+                        .map(|(&(shader, _), layout)| Stage {
+                            shader: shader.clone(),
+                            user_data: layout.user_data,
+                            root_cbvs: layout.root_cbvs,
+                            root_srvs: layout.root_srvs,
+                            root_uavs: layout.root_uavs,
+                            aliases: layout.aliases,
+                        })
+                        .collect();
+                    Some((root, blob, bound, output))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, ?shaders, "host root signature refused");
+                    None
                 }
             }
-            for (n, s) in t.static_samplers.iter().enumerate() {
-                samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(s.filter as i32),
-                    AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
-                    AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
-                    AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
-                    MipLODBias: s.mip_lod_bias,
-                    MaxAnisotropy: s.max_anisotropy,
-                    ComparisonFunc: D3D12_COMPARISON_FUNC(s.comparison as i32),
-                    BorderColor: D3D12_STATIC_BORDER_COLOR(s.border as i32),
-                    MinLOD: s.min_lod,
-                    MaxLOD: s.max_lod,
-                    ShaderRegister: n as u32,
-                    RegisterSpace: SAMPLER_SPACE,
-                    ShaderVisibility: visibility,
-                });
-            }
-            bound.push(stage);
-        }
-        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
-            Ok(root) => root,
-            Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host root signature refused");
-                return None;
-            }
+        };
+        let (root, root_blob, compute_root, compute_root_blob, bound, mesh_params) = if fallback {
+            let (compute_root, compute_root_blob, mesh_stage, output_uav) = layout(
+                &stages[..1],
+                Some((D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_SHADER_VISIBILITY_ALL)),
+                true,
+            )?;
+            let (draw_root, draw_root_blob, pixel_stage, output_srv) = layout(
+                &stages[1..],
+                Some((
+                    D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    D3D12_SHADER_VISIBILITY_VERTEX,
+                )),
+                false,
+            )?;
+            let mut bound = mesh_stage;
+            bound.extend(pixel_stage);
+            (
+                draw_root,
+                draw_root_blob,
+                Some(compute_root),
+                compute_root_blob,
+                bound,
+                output_uav.zip(output_srv),
+            )
+        } else {
+            let (root, root_blob, bound, _) = layout(&stages, None, compute.is_some())?;
+            (root, root_blob, None, Vec::new(), bound, None)
         };
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
@@ -527,11 +508,16 @@ impl HostPipeline {
                     return None;
                 }
             };
-            tracing::info!(?shaders, "host pipeline");
+            tracing::info!(
+                ?shaders,
+                profile = host.shader_profile.cache_key(),
+                "host pipeline"
+            );
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
+                mesh_fallback: None,
                 pso,
                 root,
                 stages: bound,
@@ -546,6 +532,113 @@ impl HostPipeline {
             return refuse("graphics state not kept (plain description)", shaders);
         };
         let state = g.describe();
+        if fallback {
+            let (output_uav, output_srv) = mesh_params?;
+            let Some(emulated) = mesh
+                .and_then(|ms| ms.translated())
+                .and_then(|t| t.host.mesh_fallback.as_ref())
+            else {
+                return refuse("mesh compute fallback translation is missing", shaders);
+            };
+            let Some(max_primitives) = mesh_fallback_max_primitives(
+                emulated.max_primitives,
+                emulated.max_vertices,
+                emulated.vertex_stride,
+                emulated.primitive_stride,
+                emulated.group_bytes,
+            ) else {
+                return refuse(
+                    "mesh compute fallback record does not hold its declared primitive maximum",
+                    shaders,
+                );
+            };
+            let vs = D3D12_SHADER_BYTECODE {
+                pShaderBytecode: emulated.vertex_shader.as_ptr().cast(),
+                BytecodeLength: emulated.vertex_shader.len(),
+            };
+            let compute_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: unsafe { std::mem::transmute_copy(compute_root.as_ref()?) },
+                CS: code(0),
+                ..Default::default()
+            };
+            let compute_name = super::library::name(
+                "mesh compute fallback v1",
+                &compute_root_blob,
+                &[&code_bytes(&code(0))],
+                "",
+            );
+            let compute_pso = match super::library::pipeline(
+                &compute_name,
+                |library, name| unsafe { library.LoadComputePipeline(name, &compute_desc) },
+                || unsafe { host.device.CreateComputePipelineState(&compute_desc) },
+            ) {
+                Ok(pso) => pso,
+                Err(e) => {
+                    tracing::warn!(error = %e, ?shaders, "mesh fallback compute pipeline refused");
+                    host.log_messages();
+                    return None;
+                }
+            };
+            let draw_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+                VS: vs,
+                PS: code(1),
+                BlendState: g.blend,
+                SampleMask: g.sample_mask,
+                RasterizerState: g.rasterizer,
+                DepthStencilState: g.depth,
+                IBStripCutValue: g.strip_cut,
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: g.targets.NumRenderTargets,
+                RTVFormats: g.targets.RTFormats,
+                DSVFormat: g.depth_format,
+                SampleDesc: g.samples,
+                ..Default::default()
+            };
+            let draw_name = super::library::name(
+                "mesh draw fallback v1",
+                &root_blob,
+                &[&emulated.vertex_shader, &code_bytes(&code(1))],
+                &state,
+            );
+            let pso = match super::library::pipeline(
+                &draw_name,
+                |library, name| unsafe { library.LoadGraphicsPipeline(name, &draw_desc) },
+                || unsafe { host.device.CreateGraphicsPipelineState(&draw_desc) },
+            ) {
+                Ok(pso) => pso,
+                Err(e) => {
+                    tracing::warn!(error = %e, ?shaders, "mesh fallback draw pipeline refused");
+                    host.log_messages();
+                    return None;
+                }
+            };
+            tracing::info!(
+                ?shaders,
+                profile = host.shader_profile.cache_key(),
+                "host compute-emulated mesh pipeline"
+            );
+            return Some(HostPipeline {
+                compute: false,
+                mesh: true,
+                mesh_fallback: Some(MeshFallbackPipeline {
+                    compute: compute_pso,
+                    compute_root: compute_root?,
+                    output_uav,
+                    output_srv,
+                    group_bytes: emulated.group_bytes,
+                    max_primitives,
+                }),
+                pso,
+                root,
+                stages: bound,
+                name: format!("{shaders:?}"),
+                slots: 0,
+                inputs: Vec::new(),
+                rects: false,
+                state: String::new(),
+            });
+        }
         if mesh.is_some() {
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
@@ -565,11 +658,16 @@ impl HostPipeline {
                     return None;
                 }
             };
-            tracing::info!(?shaders, "host mesh pipeline");
+            tracing::info!(
+                ?shaders,
+                profile = host.shader_profile.cache_key(),
+                "host mesh pipeline"
+            );
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
+                mesh_fallback: None,
                 pso,
                 root,
                 stages: bound,
@@ -599,12 +697,14 @@ impl HostPipeline {
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
             PS: code(1),
-            GS: rect_gs.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
-                D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: gs.as_ptr().cast(),
-                    BytecodeLength: gs.len(),
-                }
-            }),
+            GS: rect_gs
+                .as_ref()
+                .map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
+                    D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: gs.as_ptr().cast(),
+                        BytecodeLength: gs.len(),
+                    }
+                }),
             BlendState: g.blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
@@ -654,7 +754,10 @@ impl HostPipeline {
         let mut made = make(&desc, &name(rect_gs.as_ref()));
         if made.is_err() && rect_gs.is_some() {
             // The host refused the geometry stage: once more without it.
-            tracing::warn!(?shaders, "host pipeline refused with the rectangle geometry stage");
+            tracing::warn!(
+                ?shaders,
+                "host pipeline refused with the rectangle geometry stage"
+            );
             host.log_messages();
             desc.GS = D3D12_SHADER_BYTECODE::default();
             rect_gs = None;
@@ -668,7 +771,11 @@ impl HostPipeline {
                 return None;
             }
         };
-        tracing::info!(?shaders, "host pipeline");
+        tracing::info!(
+            ?shaders,
+            profile = host.shader_profile.cache_key(),
+            "host pipeline"
+        );
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
@@ -682,6 +789,7 @@ impl HostPipeline {
         Some(HostPipeline {
             compute: false,
             mesh: false,
+            mesh_fallback: None,
             pso,
             root,
             stages: bound,
@@ -694,7 +802,10 @@ impl HostPipeline {
                 let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
                     format!(
                         "fail {} depth-fail {} pass {} func {}",
-                        f.StencilFailOp.0, f.StencilDepthFailOp.0, f.StencilPassOp.0, f.StencilFunc.0
+                        f.StencilFailOp.0,
+                        f.StencilDepthFailOp.0,
+                        f.StencilPassOp.0,
+                        f.StencilFunc.0
                     )
                 };
                 format!(
@@ -758,15 +869,27 @@ fn mesh_pipeline(
         topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
     }
     let mut stream = Stream {
-        root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
+        root: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
+            root.as_raw(),
+        ),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
         blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
-        mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
+        mask: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
+            g.sample_mask,
+        ),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
-        targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
-        dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
+        targets: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+            g.targets,
+        ),
+        dsv: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
+            g.depth_format,
+        ),
         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
         topology: Sub(
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
@@ -793,7 +916,291 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
         return Vec::new();
     }
     // SAFETY: a translation's own bytes, alive while its shader is.
-    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
+    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }
+        .to_vec()
+}
+
+/// A stage's root arguments, as [`signature_layout`] placed them.
+struct StageLayout {
+    user_data: Option<(u32, u32)>,
+    root_cbvs: Vec<(u8, u32)>,
+    root_srvs: Vec<(u8, u32)>,
+    root_uavs: Vec<(u8, u32)>,
+    aliases: Vec<(u32, bool)>,
+}
+
+/// A root signature and where the arguments of its stages go.
+struct Signature {
+    root: ID3D12RootSignature,
+    blob: Vec<u8>,
+    stages: Vec<StageLayout>,
+    output: Option<u32>,
+}
+
+/// D3D12's limit on root-signature arguments: 64 DWORDs (a root constant
+/// is one DWORD each, a root descriptor two, a descriptor table one).
+const ROOT_DWORDS: u32 = 64;
+
+fn root_dwords(params: &[D3D12_ROOT_PARAMETER1]) -> u64 {
+    params
+        .iter()
+        .map(|parameter| match parameter.ParameterType {
+            // SAFETY: the union holds constants for this parameter type.
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS => u64::from(unsafe {
+                parameter.Anonymous.Constants.Num32BitValues
+            }),
+            D3D12_ROOT_PARAMETER_TYPE_CBV
+            | D3D12_ROOT_PARAMETER_TYPE_SRV
+            | D3D12_ROOT_PARAMETER_TYPE_UAV => 2,
+            _ => 1,
+        })
+        .sum()
+}
+
+/// The flags of a signature: the input assembler for graphics, and the
+/// direct-heap bits only for a stage that makes heap handles itself
+/// (SM 6.6). An SM 6.5 stage reads the heap through descriptor-table
+/// aliases; the direct-heap flags there make the host refuse the pipeline.
+fn root_flags(compute: bool, direct_heap: bool) -> D3D12_ROOT_SIGNATURE_FLAGS {
+    let mut flags = if compute {
+        D3D12_ROOT_SIGNATURE_FLAG_NONE
+    } else {
+        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+    };
+    if direct_heap {
+        flags |= D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+            | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+    }
+    flags
+}
+
+fn alias_range_type(class: DescriptorClass) -> D3D12_DESCRIPTOR_RANGE_TYPE {
+    match class {
+        DescriptorClass::Srv => D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        DescriptorClass::Uav => D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+        DescriptorClass::Cbv => D3D12_DESCRIPTOR_RANGE_TYPE_CBV,
+        DescriptorClass::Sampler => D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,
+    }
+}
+
+/// The root signature of the translated `stages`, and where each stage's
+/// root arguments go.
+///
+/// SM 6.5 translations read the dynamic heap through one unbounded
+/// descriptor-table alias per (class, space) they name; each alias becomes
+/// a root parameter the list binds to the base of its heap
+/// ([`crate::draw::State::bind`]). SM 6.6 translations make heap handles
+/// themselves and get the direct-heap flags instead. Refused (`Err`) when
+/// the arguments pass D3D12's 64-DWORD budget, or when the host refuses the
+/// signature.
+fn signature_layout(
+    device: &ID3D12Device,
+    selected: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
+    output: Option<(D3D12_ROOT_PARAMETER_TYPE, D3D12_SHADER_VISIBILITY)>,
+    compute: bool,
+    fallback: bool,
+) -> Result<Signature, String> {
+    let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
+    let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
+    let mut samplers = Vec::new();
+    let mut bound: Vec<StageLayout> = Vec::new();
+    let mut alias_order: Vec<DescriptorAlias> = Vec::new();
+    let mut stage_aliases: Vec<Vec<DescriptorAlias>> = Vec::new();
+    for &(shader, visibility) in selected {
+        let t = shader;
+        let mut stage = StageLayout {
+            user_data: None,
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            aliases: Vec::new(),
+        };
+        let dwords = t.user_data_dwords();
+        if dwords > 0 {
+            stage.user_data = Some((params.len() as u32, dwords));
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 0,
+                        RegisterSpace: USER_DATA_SPACE,
+                        Num32BitValues: dwords,
+                    },
+                },
+                ShaderVisibility: visibility,
+            });
+        }
+        for (slots, kind, out) in [
+            (
+                &t.root_cbvs,
+                D3D12_ROOT_PARAMETER_TYPE_CBV,
+                &mut stage.root_cbvs,
+            ),
+            (
+                &t.root_srvs,
+                D3D12_ROOT_PARAMETER_TYPE_SRV,
+                &mut stage.root_srvs,
+            ),
+            (
+                &t.root_uavs,
+                D3D12_ROOT_PARAMETER_TYPE_UAV,
+                &mut stage.root_uavs,
+            ),
+        ] {
+            for &slot in slots {
+                if fallback && slot == victory_shader::emit::SLOT_MESH_OUTPUT {
+                    continue;
+                }
+                let uav = kind == D3D12_ROOT_PARAMETER_TYPE_UAV;
+                let ours = if uav {
+                    slot == victory_shader::emit::SLOT_FAULTS
+                } else {
+                    slot == victory_shader::emit::SLOT_STRIDES
+                        || slot == victory_shader::emit::SLOT_MEMORY
+                };
+                if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
+                    ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
+                        RangeType: if uav {
+                            D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+                        } else {
+                            D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+                        },
+                        NumDescriptors: 1,
+                        BaseShaderRegister: u32::from(slot),
+                        RegisterSpace: ROOT_CBV_SPACE,
+                        Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                            | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                        OffsetInDescriptorsFromTableStart: 0,
+                    }));
+                    let at = ranges.len() - 1;
+                    let range: *const D3D12_DESCRIPTOR_RANGE1 = &*ranges[at];
+                    out.push((slot, params.len() as u32));
+                    params.push(D3D12_ROOT_PARAMETER1 {
+                        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                                NumDescriptorRanges: 1,
+                                pDescriptorRanges: range,
+                            },
+                        },
+                        ShaderVisibility: visibility,
+                    });
+                    continue;
+                }
+                out.push((slot, params.len() as u32));
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: kind,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: u32::from(slot),
+                            RegisterSpace: ROOT_CBV_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
+            }
+        }
+        for (n, s) in t.static_samplers.iter().enumerate() {
+            samplers.push(D3D12_STATIC_SAMPLER_DESC {
+                Filter: D3D12_FILTER(s.filter as i32),
+                AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
+                MipLODBias: s.mip_lod_bias,
+                MaxAnisotropy: s.max_anisotropy,
+                ComparisonFunc: D3D12_COMPARISON_FUNC(s.comparison as i32),
+                BorderColor: D3D12_STATIC_BORDER_COLOR(s.border as i32),
+                MinLOD: s.min_lod,
+                MaxLOD: s.max_lod,
+                ShaderRegister: n as u32,
+                RegisterSpace: SAMPLER_SPACE,
+                ShaderVisibility: visibility,
+            });
+        }
+        let mut mine = Vec::new();
+        for alias in &t.descriptor_aliases {
+            if !alias_order.contains(alias) {
+                alias_order.push(*alias);
+            }
+            if !mine.contains(alias) {
+                mine.push(*alias);
+            }
+        }
+        stage_aliases.push(mine);
+        bound.push(stage);
+    }
+    let output = output.map(|(parameter, visibility)| {
+        let index = params.len() as u32;
+        params.push(D3D12_ROOT_PARAMETER1 {
+            ParameterType: parameter,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: u32::from(victory_shader::emit::SLOT_MESH_OUTPUT),
+                    RegisterSpace: ROOT_CBV_SPACE,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                },
+            },
+            ShaderVisibility: visibility,
+        });
+        index
+    });
+    let alias_base = params.len() as u32;
+    for alias in &alias_order {
+        let sampler = alias.class == DescriptorClass::Sampler;
+        ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
+            RangeType: alias_range_type(alias.class),
+            NumDescriptors: u32::MAX,
+            BaseShaderRegister: 0,
+            RegisterSpace: alias.space,
+            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                | if sampler {
+                    D3D12_DESCRIPTOR_RANGE_FLAG_NONE
+                } else {
+                    D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE
+                },
+            OffsetInDescriptorsFromTableStart: 0,
+        }));
+        let at = ranges.len() - 1;
+        let range: *const D3D12_DESCRIPTOR_RANGE1 = &*ranges[at];
+        params.push(D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: range,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        });
+    }
+    for (stage, mine) in bound.iter_mut().zip(&stage_aliases) {
+        stage.aliases = mine
+            .iter()
+            .map(|alias| {
+                let at = alias_order
+                    .iter()
+                    .position(|other| other == alias)
+                    .expect("the alias was collected");
+                (alias_base + at as u32, alias.class == DescriptorClass::Sampler)
+            })
+            .collect();
+    }
+    let dwords = root_dwords(&params);
+    if dwords > u64::from(ROOT_DWORDS) {
+        return Err(format!(
+            "the root signature needs {dwords} DWORDs; D3D12 allows {ROOT_DWORDS}"
+        ));
+    }
+    let direct_heap = selected.iter().any(|(shader, _)| shader.direct_heap);
+    let (root, blob) = root_signature(device, &params, &samplers, compute, direct_heap)
+        .map_err(|e| e.to_string())?;
+    Ok(Signature {
+        root,
+        blob,
+        stages: bound,
+        output,
+    })
 }
 
 fn root_signature(
@@ -801,12 +1208,8 @@ fn root_signature(
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
     compute: bool,
+    direct_heap: bool,
 ) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
-    let input = if compute {
-        D3D12_ROOT_SIGNATURE_FLAG_NONE
-    } else {
-        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
-    };
     let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
         Version: windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1_1,
         Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
@@ -815,9 +1218,7 @@ fn root_signature(
                 pParameters: params.as_ptr(),
                 NumStaticSamplers: samplers.len() as u32,
                 pStaticSamplers: samplers.as_ptr(),
-                Flags: input
-                    | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                    | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                Flags: root_flags(compute, direct_heap),
             },
         },
     };
@@ -849,6 +1250,26 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    #[test]
+    fn mesh_fallback_primitives_fit_the_group_record() {
+        assert_eq!(mesh_fallback_max_primitives(0, 0, 0, 0, 16), Some(0));
+        assert_eq!(mesh_fallback_max_primitives(1, 3, 20, 16, 112), Some(1));
+        assert_eq!(mesh_fallback_max_primitives(3, 3, 20, 16, 112), None);
+        assert_eq!(
+            mesh_fallback_max_primitives(256, 0, 0, 0, 16 + 12 * 256 + 16),
+            Some(256)
+        );
+        assert_eq!(
+            mesh_fallback_max_primitives(4, 0, 0, 0, 16 + 12 * 4 - 1),
+            None
+        );
+        assert_eq!(mesh_fallback_max_primitives(257, 0, 0, 0, u32::MAX), None);
+        assert_eq!(
+            mesh_fallback_max_primitives(u32::MAX, 0, 0, 0, u32::MAX),
+            None
+        );
+    }
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
@@ -913,7 +1334,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
         let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
-        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let (root, root_blob) = root_signature(&host.device, &[], &[], false, false).unwrap();
         let mut g = GraphicsState::default();
         // This pipeline has only a color target, with no depth buffer.
         g.depth.DepthEnable = false.into();
@@ -927,5 +1348,602 @@ mod tests {
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
         );
+    }
+
+    use std::sync::OnceLock;
+
+    use victory_shader::HwStage;
+    use victory_shader::emit::{MeshFallback, ShaderProfile};
+    use victory_shader::RootType;
+
+    /// The adapter's highest shader model (`D3D_SHADER_MODEL`).
+    fn highest_shader_model(device: &ID3D12Device) -> u32 {
+        let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        // SAFETY: a plain feature query writing its own structure.
+        let queried = unsafe {
+            device.CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut model).cast(),
+                size_of_val(&model) as u32,
+            )
+        };
+        queried.expect("shader model query");
+        model.HighestShaderModel.0 as u32
+    }
+
+    /// The software adapter, when it runs SM 6.6: the SM 6.6 tests run
+    /// there on cards that stop at 6.5.
+    fn sm66_software_device() -> Option<ID3D12Device> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter, IDXGIFactory4,
+        };
+        // SAFETY: plain DXGI and D3D12 object creation.
+        unsafe {
+            let factory: IDXGIFactory4 =
+                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+            let device = device?;
+            (highest_shader_model(&device) >= 0x66).then_some(device)
+        }
+    }
+
+    fn host_shader(
+        stage: HwStage,
+        profile: ShaderProfile,
+        dxil: Vec<u8>,
+        aliases: &[(DescriptorClass, u32)],
+        direct_heap: bool,
+    ) -> HostShader {
+        HostShader {
+            stage,
+            profile,
+            dxil,
+            descriptor_aliases: aliases
+                .iter()
+                .map(|&(class, space)| DescriptorAlias { class, space })
+                .collect(),
+            direct_heap,
+            mesh_fallback: None,
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            root_indexed_views: Vec::new(),
+        }
+    }
+
+    /// A translated shader for a host pipeline, without a console
+    /// container: the translation is given.
+    fn shader_with(stage: &'static str, host: HostShader) -> Arc<Shader> {
+        let shader = Shader {
+            stage,
+            hash: "0000000000000000".to_owned(),
+            container: Vec::new(),
+            translated: OnceLock::new(),
+        };
+        assert!(
+            shader
+                .translated
+                .set(Some(Translated {
+                    host,
+                    used: Vec::new(),
+                    stores: false,
+                }))
+                .is_ok(),
+            "the translation was already set"
+        );
+        Arc::new(shader)
+    }
+
+    fn graphics_state() -> GraphicsState {
+        let mut g = GraphicsState::default();
+        g.depth.DepthEnable = false.into();
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        g
+    }
+
+    /// A buffer of `size` bytes in a heap of the given type.
+    fn buffer(
+        device: &ID3D12Device,
+        heap: D3D12_HEAP_TYPE,
+        size: u64,
+        state: D3D12_RESOURCE_STATES,
+    ) -> ID3D12Resource {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut made: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a buffer; nothing is mapped yet.
+        unsafe {
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: heap,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    state,
+                    None,
+                    &mut made,
+                )
+                .expect("buffer")
+        };
+        made.expect("buffer")
+    }
+
+    const VS65: &str = "struct V { float4 p : SV_Position; };
+        V main(uint id : SV_VertexID) {
+            V v;
+            v.p = float4(0, 0, 0, 1);
+            return v;
+        }";
+    const VS65_PULL: &str = "struct V { float4 p : SV_Position; };
+        StructuredBuffer<float4> positions : register(t0, space2);
+        V main(uint id : SV_VertexID) {
+            V v;
+            v.p = positions[id];
+            return v;
+        }";
+    const PS65_ALIASED: &str = "Texture2D<float4> tex : register(t0, space2);
+        SamplerState samp : register(s0, space3);
+        float4 main() : SV_Target { return tex.SampleLevel(samp, float2(1, 1), 0); }";
+    const CS65_ALIASED: &str = "StructuredBuffer<uint> input : register(t0, space2);
+        RWStructuredBuffer<uint> output : register(u1, space3);
+        [numthreads(1, 1, 1)]
+        void main(uint3 id : SV_DispatchThreadID) { output[0] = input[0] + 1; }";
+    const CS66_DIRECT: &str = "[numthreads(1, 1, 1)]
+        void main(uint3 id : SV_DispatchThreadID) {
+            RWTexture2D<float4> target = ResourceDescriptorHeap[1];
+            target[id.xy] = float4(1, 1, 1, 1);
+        }";
+
+    #[test]
+    fn direct_heap_flags_come_only_from_an_sm66_stage() {
+        let graphics = root_flags(false, false);
+        assert_ne!(
+            graphics.0 & D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT.0,
+            0
+        );
+        assert_eq!(
+            graphics.0 & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED.0,
+            0
+        );
+        assert_eq!(
+            graphics.0 & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED.0,
+            0
+        );
+        assert_eq!(root_flags(true, false).0, 0);
+        let direct = root_flags(true, true);
+        assert_ne!(
+            direct.0 & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED.0,
+            0
+        );
+        assert_ne!(
+            direct.0 & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED.0,
+            0
+        );
+    }
+
+    /// One alias shared by two stages is one root parameter; a stage's
+    /// other alias gets its own.
+    #[test]
+    fn aliases_are_shared_across_stages() {
+        let Some(host) = host() else {
+            return;
+        };
+        let vs = host_shader(
+            HwStage::Vs,
+            ShaderProfile::Sm65,
+            Vec::new(),
+            &[(DescriptorClass::Srv, 2)],
+            false,
+        );
+        let ps = host_shader(
+            HwStage::Ps,
+            ShaderProfile::Sm65,
+            Vec::new(),
+            &[
+                (DescriptorClass::Srv, 2),
+                (DescriptorClass::Sampler, 3),
+            ],
+            false,
+        );
+        let signature = signature_layout(
+            &host.device,
+            &[
+                (&vs, D3D12_SHADER_VISIBILITY_VERTEX),
+                (&ps, D3D12_SHADER_VISIBILITY_PIXEL),
+            ],
+            None,
+            false,
+            false,
+        )
+        .expect("SM 6.5 root signature");
+        assert_eq!(signature.stages[0].aliases, [(0, false)]);
+        assert_eq!(
+            signature.stages[1].aliases,
+            [(0, false), (1, true)],
+            "the shared SRV alias then the sampler"
+        );
+    }
+
+    #[test]
+    fn a_signature_over_the_root_dword_budget_is_refused() {
+        let Some(host) = host() else {
+            return;
+        };
+        let mut shader = host_shader(HwStage::Cs, ShaderProfile::Sm65, Vec::new(), &[], false);
+        // 61 dwords rounded to 64, then one root descriptor: 66.
+        shader.user_data.push(victory_shader::emit::UserData {
+            index: 60,
+            slot: 0,
+            root: RootType::Constants,
+            dword: 0,
+        });
+        shader.root_cbvs.push(0);
+        let error = signature_layout(
+            &host.device,
+            &[(&shader, D3D12_SHADER_VISIBILITY_ALL)],
+            None,
+            true,
+            false,
+        )
+        .err()
+        .expect("a signature over the budget was accepted");
+        assert!(error.contains("66"), "{error}");
+        assert!(error.contains("64"), "{error}");
+    }
+
+    /// SM 6.5: the dynamic-heap aliases become descriptor tables in the
+    /// root signature (no direct-heap flags), and the graphics pipeline
+    /// built from them passes the host.
+    #[test]
+    fn sm65_graphics_pipeline_binds_descriptor_aliases() {
+        let Some(host) = host() else {
+            return;
+        };
+        if highest_shader_model(&host.device) < 0x65 {
+            eprintln!("no SM 6.5 device; skipped");
+            return;
+        }
+        let Some(dxc) = dxc() else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let vs = compile(&dxc, dir.path(), VS65_PULL, "vs_6_5");
+        let ps = compile(&dxc, dir.path(), PS65_ALIASED, "ps_6_5");
+        let vs = shader_with(
+            "vertex",
+            host_shader(
+                HwStage::Vs,
+                ShaderProfile::Sm65,
+                vs,
+                &[(DescriptorClass::Srv, 2)],
+                false,
+            ),
+        );
+        let ps = shader_with(
+            "pixel",
+            host_shader(
+                HwStage::Ps,
+                ShaderProfile::Sm65,
+                ps,
+                &[
+                    (DescriptorClass::Srv, 2),
+                    (DescriptorClass::Sampler, 3),
+                ],
+                false,
+            ),
+        );
+        let g = graphics_state();
+        let p = HostPipeline::new(&[vs, ps], Some(&g)).expect("SM 6.5 graphics pipeline");
+        assert_eq!(
+            p.stages[0].aliases,
+            [(0, false)],
+            "the vertex stage's SRV alias"
+        );
+        assert_eq!(
+            p.stages[1].aliases,
+            [(0, false), (1, true)],
+            "the shared SRV alias then the sampler"
+        );
+    }
+
+    /// SM 6.5: a dispatch through two aliases bound at the heap's base
+    /// reads descriptor 0 and writes descriptor 1.
+    #[test]
+    fn sm65_compute_dispatch_binds_descriptor_aliases() {
+        use windows::core::Interface;
+        let Some(host) = host() else {
+            return;
+        };
+        if highest_shader_model(&host.device) < 0x65 {
+            eprintln!("no SM 6.5 device; skipped");
+            return;
+        }
+        let Some(dxc) = dxc() else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cs = compile(&dxc, dir.path(), CS65_ALIASED, "cs_6_5");
+        let cs = shader_with(
+            "compute",
+            host_shader(
+                HwStage::Cs,
+                ShaderProfile::Sm65,
+                cs,
+                &[(DescriptorClass::Srv, 2), (DescriptorClass::Uav, 3)],
+                false,
+            ),
+        );
+        let p = HostPipeline::new(&[cs], None).expect("SM 6.5 compute pipeline");
+        assert_eq!(p.stages[0].aliases, [(0, false), (1, false)]);
+        // SAFETY: plain D3D12 objects; every description points at live
+        // data and every resource lives until the fence says the card is
+        // done.
+        unsafe {
+            let device = &host.device;
+            let input = host.uav_buffer(4).expect("input buffer");
+            let output = host.uav_buffer(4).expect("output buffer");
+            let upload = buffer(
+                device,
+                D3D12_HEAP_TYPE_UPLOAD,
+                4,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            );
+            let readback = buffer(
+                device,
+                D3D12_HEAP_TYPE_READBACK,
+                4,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
+            let mut mapped = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut mapped)).expect("map input");
+            mapped.cast::<u32>().write(41);
+            upload.Unmap(0, None);
+            let heap: ID3D12DescriptorHeap = device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 2,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    ..Default::default()
+                })
+                .expect("view heap");
+            let step = device.GetDescriptorHandleIncrementSize(
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            ) as usize;
+            let start = heap.GetCPUDescriptorHandleForHeapStart();
+            device.CreateShaderResourceView(
+                &input,
+                Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_UNKNOWN,
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_SRV {
+                            FirstElement: 0,
+                            NumElements: 1,
+                            StructureByteStride: 4,
+                            ..Default::default()
+                        },
+                    },
+                }),
+                start,
+            );
+            let mut at = start;
+            at.ptr += step;
+            device.CreateUnorderedAccessView(
+                &output,
+                None,
+                Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_UNKNOWN,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            FirstElement: 0,
+                            NumElements: 1,
+                            StructureByteStride: 4,
+                            ..Default::default()
+                        },
+                    },
+                }),
+                at,
+            );
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .expect("queue");
+            let allocator: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .expect("allocator");
+            let list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(
+                    0,
+                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &allocator,
+                    Some(&p.pso),
+                )
+                .expect("list");
+            list.ResourceBarrier(&[
+                crate::host::transition(
+                    &input,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                ),
+                crate::host::transition(
+                    &output,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                ),
+            ]);
+            list.CopyBufferRegion(&input, 0, &upload, 0, 4);
+            list.ResourceBarrier(&[crate::host::transition(
+                &input,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            )]);
+            list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            list.SetComputeRootSignature(&p.root);
+            let base = heap.GetGPUDescriptorHandleForHeapStart();
+            for &(param, _) in &p.stages[0].aliases {
+                // The same heap, from its first descriptor: alias
+                // register 0 is heap slot 0 and register 1 is slot 1.
+                list.SetComputeRootDescriptorTable(param, base);
+            }
+            list.Dispatch(1, 1, 1);
+            list.ResourceBarrier(&[crate::host::transition(
+                &output,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.CopyBufferRegion(&readback, 0, &output, 0, 4);
+            list.Close().expect("close");
+            queue.ExecuteCommandLists(&[Some(
+                list.cast::<ID3D12CommandList>().expect("command list"),
+            )]);
+            let fence: ID3D12Fence = device
+                .CreateFence(0, D3D12_FENCE_FLAG_NONE)
+                .expect("fence");
+            queue.Signal(&fence, 1).expect("signal");
+            while fence.GetCompletedValue() < 1 {
+                if let Err(e) = device.GetDeviceRemovedReason() {
+                    panic!("device removed: {e}");
+                }
+                std::thread::yield_now();
+            }
+            device.GetDeviceRemovedReason().expect("device removed");
+            let mut mapped = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut mapped)).expect("map output");
+            let value = mapped.cast::<u32>().read();
+            readback.Unmap(0, None);
+            assert_eq!(value, 42, "the dispatch read alias slot 0 and wrote slot 1");
+        }
+    }
+
+    /// SM 6.6: the direct-heap flags are added, without alias tables.
+    /// Runs on the card when it reaches SM 6.6, else on the software
+    /// adapter when that one does.
+    #[test]
+    fn sm66_compute_pipeline_uses_direct_heaps() {
+        let Some(dxc) = dxc() else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cs = compile(&dxc, dir.path(), CS66_DIRECT, "cs_6_6");
+        let cs = host_shader(HwStage::Cs, ShaderProfile::Sm66, cs, &[], true);
+        if host().is_some_and(|host| highest_shader_model(&host.device) >= 0x66) {
+            let shader = shader_with("compute", cs);
+            let p = HostPipeline::new(&[shader], None).expect("SM 6.6 compute pipeline");
+            assert!(p.stages[0].aliases.is_empty());
+            return;
+        }
+        let Some(device) = sm66_software_device() else {
+            eprintln!("no SM 6.6 device or software adapter; skipped");
+            return;
+        };
+        let signature = signature_layout(
+            &device,
+            &[(&cs, D3D12_SHADER_VISIBILITY_ALL)],
+            None,
+            true,
+            false,
+        )
+        .expect("SM 6.6 root signature");
+        assert!(signature.stages[0].aliases.is_empty());
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            // SAFETY: a borrowed pointer the description never releases.
+            pRootSignature: unsafe { std::mem::transmute_copy(&signature.root) },
+            CS: code(&cs.dxil),
+            ..Default::default()
+        };
+        // SAFETY: the description points at live data.
+        let _pso: ID3D12PipelineState =
+            unsafe { device.CreateComputePipelineState(&desc) }.expect("SM 6.6 compute pipeline");
+    }
+
+    /// The compute-emulated mesh path builds its dispatch and draw
+    /// pipelines from the SM 6.5 signatures (the dispatch's output table and
+    /// the draw's vertex stage are extra root parameters).
+    #[test]
+    fn sm65_mesh_fallback_builds_both_pipelines() {
+        if !crate::mesh_fallback::enabled() {
+            eprintln!("hardware mesh shaders are used; skipped");
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        if highest_shader_model(&host.device) < 0x65 {
+            eprintln!("no SM 6.5 device; skipped");
+            return;
+        }
+        eprintln!(
+            "mesh fallback pipeline: HighestShaderModel={:#x} selected={}",
+            highest_shader_model(&host.device),
+            host.shader_profile.cache_key()
+        );
+        let Some(dxc) = dxc() else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cs = compile(&dxc, dir.path(), CS65_ALIASED, "cs_6_5");
+        let vs = compile(&dxc, dir.path(), VS65, "vs_6_5");
+        let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
+        let mut mesh = host_shader(
+            HwStage::Ms,
+            ShaderProfile::Sm65,
+            cs,
+            &[(DescriptorClass::Srv, 2), (DescriptorClass::Uav, 3)],
+            false,
+        );
+        mesh.mesh_fallback = Some(MeshFallback {
+            vertex_shader: vs,
+            group_bytes: 256,
+            vertex_stride: 12,
+            primitive_stride: 12,
+            max_vertices: 3,
+            max_primitives: 1,
+        });
+        let mesh = shader_with("mesh", mesh);
+        let ps = shader_with(
+            "pixel",
+            host_shader(HwStage::Ps, ShaderProfile::Sm65, ps, &[], false),
+        );
+        let g = graphics_state();
+        let p = HostPipeline::new(&[mesh, ps], Some(&g)).expect("mesh fallback pipeline");
+        assert!(p.mesh);
+        let fallback = p.mesh_fallback.as_ref().expect("compute fallback");
+        assert_eq!(fallback.max_primitives, 1);
+        assert_eq!(fallback.group_bytes, 256);
+        // The mesh stage's aliases belong to the compute signature, after
+        // its output UAV; the pixel stage has none.
+        assert_eq!(p.stages[0].aliases, [(1, false), (2, false)]);
+        assert!(p.stages[1].aliases.is_empty());
     }
 }

@@ -141,9 +141,10 @@ extern "system" fn adapter_description(_: This, out: *mut AdapterDescription) ->
     for (slot, unit) in name.iter_mut().zip("VIctory console GPU".encode_utf16()) {
         *slot = unit;
     }
-    // shortcut: memory sizes are the title's split (GPU-optimal, standard),
-    // not measured; revisit once memory is emulated.
-    let (gpu_optimal, standard) = crate::console::current().title_memory();
+    // shortcut: memory sizes are the title's effective split (the console's
+    // figure lowered by the memory profile), not measured; revisit once
+    // memory is emulated.
+    let (gpu_optimal, standard) = crate::console::effective_title_memory();
     let description = AdapterDescription {
         name,
         vendor: AMD,
@@ -235,7 +236,11 @@ fn display_size() -> (u32, u32) {
             Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
             _ => (3840, 2160),
         };
-        tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
+        tracing::info!(
+            width = size.0,
+            height = size.1,
+            "display mode reported to the title"
+        );
         size
     })
 }

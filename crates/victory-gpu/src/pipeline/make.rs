@@ -48,7 +48,13 @@ impl Pending {
             key.update(s.stage.as_bytes());
             key.update(s.hash.as_bytes());
         }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        key.update(
+            graphics
+                .as_ref()
+                .map(|g| g.describe())
+                .unwrap_or_default()
+                .as_bytes(),
+        );
         Pending {
             shaders,
             graphics,
@@ -191,7 +197,10 @@ fn wait(p: &Pending, frame: u64) {
         if rest.is_zero() {
             break;
         }
-        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+        held = done
+            .wait_timeout(held, rest)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
     drop(held);
     let waited = started.elapsed().min(left);
@@ -276,7 +285,10 @@ fn start(p: &Arc<Pending>, priority: u8) {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
         if new {
-            PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+            PEAK.fetch_max(
+                WAITING.fetch_add(1, Ordering::Relaxed) + 1,
+                Ordering::Relaxed,
+            );
         }
         AVAILABLE.notify_one();
     }
@@ -292,12 +304,119 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// The range of workers unless `VICTORY_PIPELINE_WORKERS` says otherwise.
+const WORKERS_MIN: usize = 2;
+const WORKERS_MAX: usize = 8;
+
+/// An override above this is a typo, not a request.
+const WORKERS_OVERRIDE_MAX: usize = 64;
+
+/// `VICTORY_PIPELINE_WORKERS`: one to 64 workers, as given.
+fn parse_workers(value: &str) -> Option<usize> {
+    value
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|&n| (1..=WORKERS_OVERRIDE_MAX).contains(&n))
+}
+
+/// At most this many logical processors: the machines small enough that a pipeline worker
+/// sitting on every physical core starves the title's own threads.
+const WORKERS_SMALL: usize = 8;
+
+/// How many workers to start, given the logical processors the process may run on and its
+/// physical cores when known. Half the logical processors, as before. On a small SMT machine
+/// one physical core is left to the title's own threads (recording, loading): six recording
+/// threads beside four pipeline workers on a 4C/8T Xeon put nine runnable threads on eight
+/// logical processors, and the workers run below normal priority. Machines of twelve logical
+/// processors or more keep their halves (six, eight, or the cap) as before.
+fn worker_count(logical: usize, physical: Option<usize>) -> usize {
+    let logical = logical.max(1);
+    let halves = (logical / 2).clamp(WORKERS_MIN, WORKERS_MAX);
+    match physical {
+        Some(physical) if logical <= WORKERS_SMALL && physical < logical => {
+            halves.min(physical.saturating_sub(1).clamp(WORKERS_MIN, WORKERS_MAX))
+        }
+        _ => halves,
+    }
+}
+
+/// The machine's physical cores, across processor groups; `None` if Windows cannot say.
+fn physical_cores() -> Option<usize> {
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, RelationProcessorCore,
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+    let mut bytes = 0u32;
+    // SAFETY: a null buffer asks for the length the answer needs.
+    unsafe {
+        GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut bytes)
+    };
+    if bytes == 0 {
+        return None;
+    }
+    let mut buffer = vec![0u64; (bytes as usize).div_ceil(8)];
+    // SAFETY: the buffer is at least `bytes` long and 8-byte aligned, as the record needs.
+    let ok = unsafe {
+        GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            buffer
+                .as_mut_ptr()
+                .cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(),
+            &mut bytes,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let bytes = bytes as usize;
+    let mut at = 0usize;
+    let mut cores = 0usize;
+    while at + 8 <= bytes {
+        // SAFETY: inside the buffer the call filled; `Size` is the second u32 of a record.
+        let size = unsafe {
+            buffer
+                .as_ptr()
+                .cast::<u8>()
+                .add(at + 4)
+                .cast::<u32>()
+                .read_unaligned()
+        } as usize;
+        if size < 8 || at + size > bytes {
+            return None;
+        }
+        cores += 1;
+        at += size;
+    }
+    (cores > 0).then_some(cores)
+}
+
+/// Starts the workers on first use: [`worker_count`], or `VICTORY_PIPELINE_WORKERS`.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let logical = std::thread::available_parallelism().map_or(2, |n| n.get());
+        let physical = physical_cores();
+        let requested = std::env::var("VICTORY_PIPELINE_WORKERS").ok();
+        let overridden = requested.as_deref().and_then(parse_workers);
+        if let Some(value) = requested.as_deref()
+            && overridden.is_none()
+        {
+            tracing::warn!(
+                value,
+                max = WORKERS_OVERRIDE_MAX,
+                "VICTORY_PIPELINE_WORKERS is not a worker count; using the default"
+            );
+        }
+        let workers = overridden.unwrap_or_else(|| worker_count(logical, physical));
+        tracing::info!(
+            logical,
+            physical = physical.unwrap_or(0),
+            workers,
+            overridden = overridden.is_some(),
+            "host pipeline workers"
+        );
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
@@ -375,6 +494,37 @@ mod tests {
         assert!(ready(&p).is_none());
         assert!(p.made.get().is_none());
         assert!(super::super::library::wanted_early(&p.key));
+    }
+
+    /// A 4C/8T machine gets three workers instead of four; twelve threads or more keep the
+    /// old counts, so 16 threads still get eight.
+    #[test]
+    fn worker_counts_leave_one_physical_core_to_the_title() {
+        assert_eq!(worker_count(8, Some(4)), 3);
+        assert_eq!(worker_count(12, Some(6)), 6);
+        assert_eq!(worker_count(16, Some(8)), 8);
+        assert_eq!(worker_count(32, Some(16)), 8);
+        // No SMT (or no answer from Windows): as before.
+        assert_eq!(worker_count(4, Some(4)), 2);
+        assert_eq!(worker_count(8, None), 4);
+        assert_eq!(worker_count(16, None), 8);
+        // Tiny machines still start two; they cannot start fewer than before either.
+        assert_eq!(worker_count(1, Some(1)), 2);
+        assert_eq!(worker_count(2, Some(2)), 2);
+        assert_eq!(worker_count(2, Some(1)), 2);
+    }
+
+    /// The worker override takes one to 64 and rejects everything else.
+    #[test]
+    fn worker_override_is_parsed_with_bounds() {
+        assert_eq!(parse_workers("6"), Some(6));
+        assert_eq!(parse_workers(" 1 "), Some(1));
+        assert_eq!(parse_workers("64"), Some(64));
+        assert_eq!(parse_workers("0"), None);
+        assert_eq!(parse_workers("65"), None);
+        assert_eq!(parse_workers("-2"), None);
+        assert_eq!(parse_workers("many"), None);
+        assert_eq!(parse_workers(""), None);
     }
 
     #[test]

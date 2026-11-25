@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::memory::{self, ProfileRequest};
 use crate::policy::ensure_outside_repo;
 
 #[derive(Debug, Default, Clone)]
@@ -22,6 +23,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Other titles used to exercise platform-level code.
     pub test_titles: Vec<PathBuf>,
+    /// The memory profile asked for in the file, if any.
+    pub memory_profile: Option<ProfileRequest>,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
 }
@@ -31,6 +34,14 @@ pub struct Config {
 struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
+    #[serde(default)]
+    memory: FileMemory,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileMemory {
+    profile: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -70,7 +81,29 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        let FileConfig { paths, memory } = parsed;
+        let env_profile = std::env::var("VICTORY_MEMORY_PROFILE")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let asked = env_profile.as_deref().or(memory.profile.as_deref());
+        let memory_profile = asked.map(|value| match ProfileRequest::parse(value) {
+            Some(request) => request,
+            None => {
+                tracing::warn!(
+                    value,
+                    "memory profile is not auto, off, series-s or series-x; using auto"
+                );
+                ProfileRequest::Auto
+            }
+        });
+        if let Some(request) = memory_profile {
+            memory::set_request(request);
+        }
+        let config = Self::resolve(paths, source, |k| std::env::var_os(k))?;
+        Ok(Config {
+            memory_profile,
+            ..config
+        })
     }
 
     fn resolve(
@@ -96,6 +129,7 @@ impl Config {
             cache_dir,
             data_dir,
             test_titles,
+            memory_profile: None,
             source,
         })
     }
