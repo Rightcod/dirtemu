@@ -84,6 +84,10 @@ fn address_range(flags: u64) -> (usize, usize) {
     (1 << 32, (1 << bits) - 1)
 }
 
+fn trace_on() -> bool {
+    std::env::var_os("VICTORY_XMEM_TRACE").is_some_and(|v| v != "0")
+}
+
 pub extern "system" fn XMemVirtualAlloc(
     base: *mut c_void,
     size: usize,
@@ -91,6 +95,7 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    let asked = (base, size, kind, flags, protect);
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
@@ -114,6 +119,9 @@ pub extern "system" fn XMemVirtualAlloc(
     if placeholder {
         if kind & MEM_REPLACE_PLACEHOLDER != 0 {
             // Part of a placeholder the title split: it stays one.
+            if trace_on() {
+                tracing::info!(base = format_args!("{base:p}"), size, kind = format_args!("{kind:#x}"), flags = format_args!("{flags:#x}"), "XMemVirtualAlloc replace");
+            }
             return base;
         }
         protect = PAGE_NOACCESS;
@@ -153,7 +161,18 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
-    if base.is_null() {
+    if trace_on() {
+        let (asked_base, asked_size, asked_kind, asked_flags, asked_protect) = asked;
+        tracing::info!(
+            base = format_args!("{asked_base:p}"),
+            size = asked_size,
+            kind = format_args!("{asked_kind:#x}"),
+            flags = format_args!("{asked_flags:#x}"),
+            protect = format_args!("{asked_protect:#x}"),
+            at = format_args!("{at:p}"),
+            "xmem virtual alloc"
+        );
+    } else if base.is_null() {
         tracing::debug!(
             size,
             kind = format_args!("{kind:#x}"),
@@ -453,6 +472,9 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
+    if trace_on() {
+        tracing::info!(n, flags = format_args!("{flags:#x}"), "xmem physical alloc");
+    }
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
@@ -624,6 +646,14 @@ pub extern "system" fn XMemMapPhysicalPages(
 ) -> *mut c_void {
     let base = address as usize;
     let mut physical = physical();
+    if trace_on() {
+        tracing::info!(
+            at = format_args!("{base:#x}"),
+            n,
+            null = pages.is_null(),
+            "xmem map physical"
+        );
+    }
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
@@ -652,6 +682,14 @@ pub extern "system" fn XMemMapPhysicalPages(
             })
             .count();
         if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+            if trace_on() {
+                tracing::info!(
+                    at = format_args!("{:#x}", base + i * PAGE),
+                    len = run * PAGE,
+                    page = pages[i],
+                    "xmem map FAILED"
+                );
+            }
             return std::ptr::null_mut();
         }
         i += run;

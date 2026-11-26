@@ -26,6 +26,7 @@ const ROOT_SIGNATURE_IIDS: [Iid; 3] = [
 ];
 
 const CONSOLE_FLAGS: u32 = 0xff00_0000;
+const TRANSLATED_BINDLESS_FLAGS: u32 = 0x0000_0c00;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -79,14 +80,15 @@ fn host_export(cache: &OnceLock<Option<usize>>, name: &CStr) -> Option<usize> {
 }
 
 fn without_console_flags(desc: Desc) -> Desc {
-    if desc.flags & CONSOLE_FLAGS != 0 {
+    let translated = CONSOLE_FLAGS | TRANSLATED_BINDLESS_FLAGS;
+    if desc.flags & translated != 0 {
         tracing::debug!(
             flags = format_args!("{:#x}", desc.flags),
-            "console root signature flags dropped"
+            "root signature flags handled by translation dropped"
         );
     }
     Desc {
-        flags: desc.flags & !CONSOLE_FLAGS,
+        flags: desc.flags & !translated,
         ..desc
     }
 }
@@ -216,6 +218,36 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[cfg(windows)]
+    #[test]
+    fn translated_bindless_roots_serialize_with_the_system_runtime() {
+        for flags in [0x400, 0x800, 0xc00, 0x0200_0c01] {
+            let desc = VersionedDesc {
+                version: 2,
+                desc: Desc {
+                    parameter_count: 0,
+                    parameters: std::ptr::null(),
+                    sampler_count: 0,
+                    samplers: std::ptr::null(),
+                    flags,
+                },
+            };
+            let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(serialize_versioned(&desc, &mut blob, &mut error), S_OK);
+            assert!(!blob.is_null());
+            assert!(error.is_null());
+            assert_eq!(desc.desc.flags, flags);
+            let blob = blob.cast_const().cast::<Object>();
+            slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
+            let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(serialize(&desc.desc, 1, &mut blob, &mut error), S_OK);
+            assert!(!blob.is_null());
+            assert!(error.is_null());
+            let blob = blob.cast_const().cast::<Object>();
+            slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
+        }
+    }
 
     /// One 32-bit constant at b0, serialized by the host, then created.
     #[cfg(windows)]

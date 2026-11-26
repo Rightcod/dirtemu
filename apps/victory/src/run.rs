@@ -107,8 +107,25 @@ pub fn run(
         return Ok(());
     }
     victory_loader::report_crashes();
-    victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    if std::env::var_os("VICTORY_CRASH_REPORT").is_none_or(|v| v != "0") {
+        victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    }
     victory_hle::runtime::use_console_timers();
+    #[cfg(windows)]
+    if let Some(ms) = victory_loader::frame_rate::asked_interval_ms() {
+        use victory_loader::frame_rate::{Patched, SITES, apply, title_interval_us, title_rate};
+        let asked = std::env::var("VICTORY_TITLE_FPS").ok();
+        if let Some(rate) = title_rate(ms, asked.as_deref()) {
+            let size = image.info().size_of_image as usize;
+            let done = unsafe { apply(image.base(), size, rate, &SITES) };
+            let patched = done.iter().filter(|d| **d == Patched::Done).count();
+            println!(
+                "frame rate: our clock {ms} ms; the title's rate {rate} ({patched} of {} reads of its setting patched; it asks for {} us at 60 Hz)",
+                SITES.len(),
+                title_interval_us(rate, false)
+            );
+        }
+    }
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
     let late = LateDlls {
@@ -216,12 +233,6 @@ impl LateDlls {
         show: impl Fn(&str, victory_loader::BindReport),
     ) -> Result<Option<usize>> {
         use victory_hle::runtime::{forget_image, image_named, set_image_path};
-        if std::env::var_os("VICTORY_DISABLE_UPSCALER").is_some_and(|v| v != "0")
-            && file.to_ascii_lowercase().contains("amd_fidelityfx_upscaler")
-        {
-            println!("upscaler       {file} disabled (VICTORY_DISABLE_UPSCALER)");
-            return Ok(None);
-        }
         // Waits while another thread initialises a DLL; a `DllMain` that
         // loads another DLL re-enters.
         self.lock.hold(|| {

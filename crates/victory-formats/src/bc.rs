@@ -19,19 +19,12 @@ fn colour_table(c0: u16, c1: u16) -> [[u8; 4]; 4] {
     let mut table = [[0u8; 4]; 4];
     table[0] = [a[0], a[1], a[2], 255];
     table[1] = [b[0], b[1], b[2], 255];
-    if c0 > c1 {
-        for i in 0..3 {
-            table[2][i] = ((2 * u16::from(a[i]) + u16::from(b[i])) / 3) as u8;
-            table[3][i] = ((u16::from(a[i]) + 2 * u16::from(b[i])) / 3) as u8;
-        }
-        table[2][3] = 255;
-        table[3][3] = 255;
-    } else {
-        for i in 0..3 {
-            table[2][i] = ((u16::from(a[i]) + u16::from(b[i])) / 2) as u8;
-        }
-        table[2][3] = 255;
+    for i in 0..3 {
+        table[2][i] = ((2 * u16::from(a[i]) + u16::from(b[i])) / 3) as u8;
+        table[3][i] = ((u16::from(a[i]) + 2 * u16::from(b[i])) / 3) as u8;
     }
+    table[2][3] = 255;
+    table[3][3] = 255;
     table
 }
 
@@ -142,8 +135,18 @@ mod tests {
         let decoded = decode_bc3_block(&blue_red);
         assert_eq!(decoded[0..4], [0, 0, 255, 255]);
         assert_eq!(decoded[4..8], [255, 0, 0, 255]);
-        assert_eq!(decoded[8..12], [127, 0, 127, 255]);
-        assert_eq!(decoded[12..16], [0, 0, 0, 255]);
+        assert_eq!(decoded[8..12], [85, 0, 170, 255]);
+        assert_eq!(decoded[12..16], [170, 0, 85, 255]);
+    }
+
+    #[test]
+    fn equal_endpoints_keep_colour_for_every_index() {
+        let indices = std::array::from_fn(|i| i as u8);
+        let encoded = block(255, 255, [0; 16], 0x07e0, 0x07e0, indices);
+        let decoded = decode_bc3_block(&encoded);
+        for pixel in decoded.chunks_exact(4) {
+            assert_eq!(pixel, [0, 255, 0, 255]);
+        }
     }
 
     #[test]

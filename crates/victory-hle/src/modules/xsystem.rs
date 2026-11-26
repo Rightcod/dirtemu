@@ -32,7 +32,7 @@ pub const ANALYTICS: Guid = Guid::new(
 );
 
 /// 38 characters (39 bytes with the NUL).
-const CONSOLE_ID: &str = "00000000000000000000000000000000000001";
+const CONSOLE_ID: &str = "00000000.00000000.00000000.00000000.00";
 /// The retail sandbox.
 const SANDBOX: &str = "RETAIL";
 /// Base64 of 32 bytes: 44 characters (45 bytes with the NUL).

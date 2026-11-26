@@ -12,7 +12,14 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     FOLDER
-        .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from))
+        .get_or_init(|| {
+            let folder = std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from)?;
+            if let Err(error) = std::fs::create_dir_all(&folder) {
+                tracing::warn!(%error, path = %folder.display(), "capture folder not created");
+                return None;
+            }
+            Some(folder)
+        })
         .as_ref()
 }
 
@@ -324,8 +331,12 @@ pub(crate) fn save_read_back(
 ) {
     let f = footprint.Footprint;
     let bgra = match f.Format {
-        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => false,
-        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => true,
+        DXGI_FORMAT_R8G8B8A8_TYPELESS
+        | DXGI_FORMAT_R8G8B8A8_UNORM
+        | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => false,
+        DXGI_FORMAT_B8G8R8A8_TYPELESS
+        | DXGI_FORMAT_B8G8R8A8_UNORM
+        | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => true,
         other => {
             tracing::warn!(format = other.0, "frame not saved: not 8-bit color");
             return;

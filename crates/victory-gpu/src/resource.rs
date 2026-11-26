@@ -263,7 +263,8 @@ pub(crate) fn bc3_host(desc: &ResourceDesc, unaligned: bool) -> Bc3Host {
         return Bc3Host::Native;
     }
     let needs_fallback = desc.dimension == TEXTURE_1D
-        || (!unaligned && (!desc.width.is_multiple_of(4) || !u64::from(desc.height).is_multiple_of(4)));
+        || (!unaligned
+            && (!desc.width.is_multiple_of(4) || !u64::from(desc.height).is_multiple_of(4)));
     if !needs_fallback {
         return Bc3Host::Native;
     }
@@ -1894,6 +1895,13 @@ pub(crate) fn host_resource<'a>(
 
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
+pub(crate) fn is_resource(this: This) -> bool {
+    let mut table = [0; size_of::<usize>()];
+    crate::host::read_into(this.cast(), &mut table)
+        && usize::from_ne_bytes(table) == RESOURCE_FUNCTIONS.0.as_ptr() as usize
+}
+
+#[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
@@ -1922,7 +1930,11 @@ fn host_texture(
     if let Bc3Host::Refuse(reason) = bc3 {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-            tracing::warn!(?desc, reason, "block-compressed texture has no host fallback");
+            tracing::warn!(
+                ?desc,
+                reason,
+                "block-compressed texture has no host fallback"
+            );
         });
         return None;
     }

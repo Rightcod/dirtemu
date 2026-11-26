@@ -6,7 +6,8 @@ param(
     [string]$Exe = "$PSScriptRoot\..\target\release\victory.exe",
     [string]$Console = "series-s"
 )
-foreach ($v in "VICTORY_KEYS", "VICTORY_CAPTURE", "VICTORY_CAPTURE_FRAMES", "VICTORY_DUMP_TARGETS") {
+$ScriptAuthor = "carunodev"
+foreach ($v in "VICTORY_KEYS", "VICTORY_CAPTURE", "VICTORY_CAPTURE_FRAMES", "VICTORY_DUMP_TARGETS", "VICTORY_DISABLE_UPSCALER", "VICTORY_STACKS") {
     Remove-Item "Env:$v" -ErrorAction SilentlyContinue
 }
 foreach ($pair in @(
