@@ -1156,6 +1156,9 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     // allocation so two textures cannot both pass the check; `Staging::drop`
     // gives the bytes back. The texture itself stays (its host copy may
     // still be sampled with stale contents) but is not uploaded.
+    if crate::residency::critical_commit() {
+        return None;
+    }
     use std::sync::atomic::Ordering::Relaxed;
     let before = STAGED[1].fetch_add(total, Relaxed);
     let fits = if streamed {
