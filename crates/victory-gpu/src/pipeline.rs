@@ -515,7 +515,11 @@ fn hand_out(
     #[cfg(windows)]
     let host = {
         let pending = make::Pending::new(shaders.clone(), graphics);
-        recipe::take(pending.key()).unwrap_or_else(|| Arc::new(pending))
+        recipe::take(pending.key()).unwrap_or_else(|| {
+            let pending = Arc::new(pending);
+            recipe::record(&pending);
+            pending
+        })
     };
     #[cfg(windows)]
     make::early(&host);
@@ -720,12 +724,15 @@ pub fn record_pipeline_recipes(dir: std::path::PathBuf) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-pub fn precompile_pipelines(jobs: usize) -> anyhow::Result<PipelinePrecompileReport> {
+pub fn precompile_pipelines(
+    jobs: usize,
+    used_only: bool,
+) -> anyhow::Result<PipelinePrecompileReport> {
     anyhow::ensure!(
         crate::host::host().is_some(),
         "no D3D12 device for precompilation"
     );
-    recipe::precompile(jobs.clamp(1, 16))
+    recipe::precompile(jobs.clamp(1, 16), used_only)
 }
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline

@@ -97,6 +97,9 @@ enum Command {
         shader: Vec<PathBuf>,
         #[arg(long)]
         jobs: Option<usize>,
+        /// Compile only the pipeline states used by a draw or dispatch in earlier runs.
+        #[arg(long)]
+        used_only: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -113,7 +116,10 @@ enum Command {
         /// Finish the shader and pipeline precompilation before starting the title.
         #[arg(long, requires = "execute", conflicts_with = "record_pipelines")]
         precompile: bool,
-        /// Save pipeline state when first used, for the next precompilation.
+        /// With --precompile, compile only previously used pipeline states.
+        #[arg(long, requires = "precompile")]
+        used_only: bool,
+        /// Save pipeline state at creation for the next precompilation.
         #[arg(long, requires = "execute")]
         record_pipelines: bool,
         /// The console model the title sees (device type, memory).
@@ -205,6 +211,7 @@ fn main() -> Result<()> {
             strict,
             execute,
             precompile,
+            used_only,
             record_pipelines,
             console,
             title_args: _,
@@ -215,6 +222,7 @@ fn main() -> Result<()> {
             execute,
             console,
             precompile,
+            used_only,
             record_pipelines,
         ),
         Command::Precompile {
@@ -222,6 +230,7 @@ fn main() -> Result<()> {
             console,
             shader,
             jobs,
+            used_only,
         } => {
             #[cfg(windows)]
             {
@@ -232,11 +241,19 @@ fn main() -> Result<()> {
                 console.select();
                 victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
                 precompile::record(&cfg, hash.as_str(), console)?;
-                precompile::prepare(&cfg, &exe, hash.as_str(), console, Some(&shader), jobs)
+                precompile::prepare(
+                    &cfg,
+                    &exe,
+                    hash.as_str(),
+                    console,
+                    Some(&shader),
+                    jobs,
+                    used_only,
+                )
             }
             #[cfg(not(windows))]
             {
-                let _ = (exe, console, shader, jobs);
+                let _ = (exe, console, shader, jobs, used_only);
                 anyhow::bail!("shader and pipeline precompilation requires Windows")
             }
         }

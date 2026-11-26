@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -84,8 +84,16 @@ fn recorder() -> Option<&'static mpsc::Sender<Work>> {
 }
 
 pub(super) fn record(p: &Arc<Pending>) {
+    if p.shaders().is_empty() {
+        return;
+    }
     if let Some(writer) = recorder() {
-        let _ = writer.send(Work::Save(p.clone()));
+        static RECORDED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+        let mut recorded = RECORDED.lock().unwrap_or_else(|e| e.into_inner());
+        let recorded = recorded.get_or_insert_with(HashSet::new);
+        if !recorded.contains(p.key()) && writer.send(Work::Save(p.clone())).is_ok() {
+            recorded.insert(p.key().to_owned());
+        }
     }
 }
 
@@ -206,7 +214,7 @@ pub struct Report {
     pub unreadable: usize,
 }
 
-pub(super) fn precompile(jobs: usize) -> anyhow::Result<Report> {
+pub(super) fn precompile(jobs: usize, used_only: bool) -> anyhow::Result<Report> {
     let dir = DIR
         .get()
         .ok_or_else(|| anyhow::anyhow!("pipeline recipe cache is not configured"))?;
@@ -218,7 +226,10 @@ pub(super) fn precompile(jobs: usize) -> anyhow::Result<Report> {
             .to_str()
             .is_some_and(|name| name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit()))
         {
-            files.push(entry.path());
+            let was_used = name.to_str().is_some_and(super::library::wanted_early);
+            if !used_only || was_used {
+                files.push((!was_used, entry.path()));
+            }
         }
     }
     files.sort_unstable();
@@ -233,13 +244,14 @@ pub(super) fn precompile(jobs: usize) -> anyhow::Result<Report> {
             for _ in 0..jobs.min(batch.len()) {
                 scope.spawn(|| {
                     loop {
-                        let Some(file) = remaining.lock().unwrap_or_else(|e| e.into_inner()).next()
+                        let Some((unused, file)) =
+                            remaining.lock().unwrap_or_else(|e| e.into_inner()).next()
                         else {
                             break;
                         };
                         let result = load(dir, file).map(|pipeline| {
                             let built = make::now(&pipeline);
-                            (pipeline, built)
+                            (pipeline, built, !unused)
                         });
                         prepared
                             .lock()
@@ -251,19 +263,21 @@ pub(super) fn precompile(jobs: usize) -> anyhow::Result<Report> {
         });
         for result in prepared.into_inner().unwrap_or_else(|e| e.into_inner()) {
             match result {
-                Ok((pipeline, built)) => {
+                Ok((pipeline, built, used)) => {
                     if built {
                         report.built += 1;
                     } else {
                         report.refused += 1;
                     }
-                    ready.insert(
-                        pipeline.key().to_owned(),
-                        Prepared {
-                            active: Arc::downgrade(&pipeline),
-                            waiting: Some(pipeline),
-                        },
-                    );
+                    if used {
+                        ready.insert(
+                            pipeline.key().to_owned(),
+                            Prepared {
+                                active: Arc::downgrade(&pipeline),
+                                waiting: Some(pipeline),
+                            },
+                        );
+                    }
                 }
                 Err(error) => {
                     report.unreadable += 1;
@@ -272,14 +286,48 @@ pub(super) fn precompile(jobs: usize) -> anyhow::Result<Report> {
             }
         }
         super::library::save(false);
-        if index % 4 == 0 || (index + 1) * 128 >= total {
-            println!(
-                "pipeline states   {}/{total} processed",
-                (index * 128 + batch.len()).min(total)
-            );
-        }
+        println!(
+            "pipeline states   {}/{total} processed",
+            index * 128 + batch.len()
+        );
     }
     super::library::save(true);
     let _ = PREPARED.set(Mutex::new(ready));
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipeline_recipes_reload_states_and_reject_changed_shader_bytes() {
+        let folder = tempfile::tempdir().unwrap();
+        let dir = folder.path();
+        std::fs::create_dir(dir.join("shaders")).unwrap();
+        std::fs::create_dir(dir.join("states")).unwrap();
+        let shaders = vec![
+            super::super::shader("vertex", b"recipe vertex"),
+            super::super::shader("pixel", b"recipe pixel"),
+        ];
+        let mut graphics = GraphicsState::default();
+        graphics.targets.NumRenderTargets = 1;
+        graphics.targets.RTFormats[0] =
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+        let original = Pending::new(shaders, Some(Box::new(graphics)));
+        save(dir, &original).unwrap();
+        save(dir, &original).unwrap();
+        assert_eq!(std::fs::read_dir(dir.join("states")).unwrap().count(), 1);
+        let path = dir.join("states").join(original.key());
+        let restored = load(dir, &path).unwrap();
+        assert_eq!(restored.key(), original.key());
+        assert_eq!(restored.shaders()[0].container, b"recipe vertex");
+        assert_eq!(
+            restored.graphics.as_ref().unwrap().describe(),
+            original.graphics.as_ref().unwrap().describe()
+        );
+        let hash = blake3::hash(b"recipe pixel");
+        std::fs::write(dir.join("shaders").join(hash.to_hex().as_str()), b"changed").unwrap();
+        assert!(load(dir, &path).is_err());
+    }
 }

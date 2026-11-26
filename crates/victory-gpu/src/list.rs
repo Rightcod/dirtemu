@@ -142,15 +142,36 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
+#[cfg_attr(feature = "diagnostics", track_caller)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
-    f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
     #[cfg(feature = "diagnostics")]
-    crate::copystat::recorded(started);
+    let acquired = std::time::Instant::now();
+    f(list, &mut state);
+    drop(state);
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::copystat::recorded(started);
+        static PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *PROFILE.get_or_init(|| std::env::var_os("VICTORY_PROFILE_LISTS").is_some())
+            && started.elapsed() >= std::time::Duration::from_millis(100)
+        {
+            let caller = std::panic::Location::caller();
+            tracing::info!(
+                frame = crate::frame::current(),
+                thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
+                line = caller.line(),
+                lock_ms = acquired.duration_since(started).as_secs_f64() * 1000.0,
+                command_ms = acquired.elapsed().as_secs_f64() * 1000.0,
+                "slow list recording call"
+            );
+        }
+    }
 }
 
 /// The submission of `lists` has run: each gives its descriptor tables'

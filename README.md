@@ -7,7 +7,7 @@ GTA VI on Windows PCs with older AMD graphics cards.
 **This repository contains no game files or assets.** You need your own copy
 of the game. Not affiliated with or endorsed by its developer or publisher.
 
-## Status (2026-11-25)
+## Status (2026-11-26)
 
 Work in progress. **Not a playable release yet.**
 
@@ -30,9 +30,9 @@ What is already implemented and tested at shader/PSO level:
 | Shadowmask PSV fix | typed-UAV PSV ordering fixed; post/shadow validation improved to 97/104 |
 | Ambient fallback | constant indirect-light fill after ScreenProbes temporal resolve, Polaris default 0.2 |
 | BC3 texture fallback | five unaligned BC3 textures decoded to RGBA8 with original dimensions |
-| Series-S memory profile | in progress; title/console budget and resource caps being wired |
+| Series-S memory profile | title memory, host-copy, texture and staging caps active |
 | Barycentrics / `attributeAtVertex` | **not solved on RX 570**; 346 real PS affected |
-| Full game boot / world / FPS | **not verified**; game package was incomplete during development |
+| Full game boot / world / FPS | boot, menus and world image confirmed on RX 570; severe stalls, missing geometry and watchdog failures remain |
 
 Known hard blockers:
 
@@ -40,9 +40,8 @@ Known hard blockers:
   `SV_Barycentrics` and/or `attributeAtVertex`.
 - 16 GiB RAM is below the practical working set observed in related forks;
   a large pagefile is required and performance will still be limited.
-- The inspected game package lacked a complete executable/data set during
-  development, so end-to-end boot and world rendering have not been proven.
-- Some HLE imports are still missing or need title-DLL/host routing.
+- Shader translation and driver pipeline refusals still omit rendering passes.
+- CPU preparation, demand paging and buffer read-back cause long frame times.
 
 ## Requirements
 
@@ -74,7 +73,7 @@ powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game fold
 
 The launcher waits for shader translation and recorded D3D12 pipelines before
 starting the title. The first run scans the package's shader archives and
-DLLs. It records new pipeline states as the title uses them. Later runs
+DLLs. It records pipeline states when the title creates them. Later runs
 prepare those exact states before the title starts. Keep the cache directory
 on the same drive across runs. Pipeline recipes are specific to the game
 build and console profile. Shader and driver refusals appear in the summary.
@@ -85,6 +84,12 @@ environment as the launcher.
 ```powershell
 victory precompile "<your game folder>\<the game's exe>" --console series-x
 ```
+
+Add `--used-only` to build only states used in previous runs.
+Translations are keyed by the translator sources, dependencies, target GPU
+and settings. Rebuilding rendering or runtime code preserves them.
+The pipeline recording and source fingerprint follow the approach in
+[carlm125/cool_fox](https://github.com/carlm125/cool_fox).
 
 For RX 570 / Polaris experiments:
 

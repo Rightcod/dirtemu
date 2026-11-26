@@ -4,7 +4,7 @@ param(
     [string]$Cache = "",
     [string]$Data = "",
     [string]$Exe = "$PSScriptRoot\..\target\release\victory.exe",
-    [string]$Console = "series-s"
+    [string]$Console = "series-x"
 )
 $ScriptAuthor = "carunodev"
 $Repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
@@ -22,7 +22,10 @@ foreach ($pair in @(
     @("VICTORY_RELAY", "2"),
     @("VICTORY_WIDE_BACK", "1"),
     @("VICTORY_JOIN_COPIES", "1"),
-    @("VICTORY_CARD_BUFFERS_MIN_MB", "1")
+    @("VICTORY_CARD_BUFFERS_MIN_MB", "8"),
+    @("VICTORY_CARD_BUFFERS_MB", "768"),
+    @("VICTORY_CARD_WINDOWS_MB", "128"),
+    @("VICTORY_CARD_REHASH_RUNS", "1")
 )) {
     if (-not (Test-Path "Env:$($pair[0])")) {
         Set-Item "Env:$($pair[0])" $pair[1]

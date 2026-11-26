@@ -16,6 +16,7 @@ mod windows {
         console: Console,
         inputs: Option<&[PathBuf]>,
         jobs: Option<usize>,
+        used_only: bool,
     ) -> Result<()> {
         let jobs = jobs
             .unwrap_or_else(|| {
@@ -33,7 +34,7 @@ mod windows {
         for path in paths {
             scan(&path, &cache, tag, jobs, &seen)?;
         }
-        let report = victory_gpu::pipeline::precompile_pipelines(jobs)?;
+        let report = victory_gpu::pipeline::precompile_pipelines(jobs, used_only)?;
         println!(
             "pipeline cache    {} ready, {} refused, {} unreadable ({}, {})",
             report.built,

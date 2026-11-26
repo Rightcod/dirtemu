@@ -509,9 +509,15 @@ void main() {
                 if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
                     return None;
                 }
-                let mut device: Option<ID3D12Device> = None;
+                let mut device = None;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
-                let device = device?;
+                Self::for_device(device?)
+            }
+        }
+
+        fn for_device(device: ID3D12Device) -> Option<Self> {
+            // SAFETY: create a queue and command list on the supplied device.
+            unsafe {
                 let queue: ID3D12CommandQueue = device
                     .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                         Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -706,9 +712,23 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
-        let Some(mut warp) = WarpHarness::new() else {
+        let Some(warp) = WarpHarness::new() else {
             return;
         };
+        card_compare_stores_hash(warp);
+    }
+
+    #[test]
+    fn host_card_compare_stores_the_hash_it_made_when_told() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        card_compare_stores_hash(
+            WarpHarness::for_device(host.device.clone()).expect("host harness"),
+        );
+    }
+
+    fn card_compare_stores_hash(mut warp: WarpHarness) {
         let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE)
             .expect("the card compare must compile on WARP");
         const PIECE: usize = 64 << 10;
@@ -737,7 +757,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list.Dispatch(PIECES, 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.

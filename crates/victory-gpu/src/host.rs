@@ -1642,7 +1642,7 @@ unsafe impl Send for CardWork {}
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
 /// The compare of a declared range of a copy in the card's memory with
-/// its bytes from before, one thread per 64 KiB piece (cut at multiples of
+/// its bytes from before, one group per 64 KiB piece (cut at multiples of
 /// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
 /// gets a dword per piece, 1 where a byte differs. The offsets are widened
 /// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
@@ -1662,11 +1662,16 @@ ByteAddressBuffer now : register(t0);
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+groupshared uint4 partial[64];
+uint4 mix_hash(uint4 h, uint4 value) {
+    h = (h ^ value) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+    return h.yzwx ^ (h >> 15);
+}
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= pieces) return;
-    uint piece = first + id.x;
+void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
+    if (group.x >= pieces) return;
+    uint piece = first + group.x;
     uint lo = piece * 65536u;
     lo = lo > skew ? lo - skew : 0u;
     uint hi = min((piece + 1u) * 65536u - skew, size);
@@ -1674,12 +1679,16 @@ void main(uint3 id : SV_DispatchThreadID) {
     hi = (hi + 15u) & ~15u;
     uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
     [loop]
-    for (uint at = lo; at < hi; at += 16u) {
-        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
-    }
+    for (uint at = lo + lane * 16u; at < hi; at += 64u * 16u)
+        h = mix_hash(h, now.Load4(at));
+    partial[lane] = h;
+    GroupMemoryBarrierWithGroupSync();
+    if (lane != 0u) return;
+    [loop]
+    for (uint other = 1u; other < 64u; ++other)
+        h = mix_hash(h, partial[other]);
     if (compare != 0u) {
-        differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        differs.Store(out_at + group.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
         if (compare == 2u) hashes.Store4(piece * 16u, h);
@@ -1696,8 +1705,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 ///
 /// These passes are ours, they run on the card before every submission's
 /// lists, and no timing so far names them: each walks its 64 KiB pieces
-/// 16 bytes at a time, 4,096 steps one after the other, so a pass takes
-/// the time of one piece however few its pieces are. Run 102 sent up 514
+/// in a group of 64 threads, so even a pass over one piece launches a
+/// whole group. Run 102 sent up 514
 /// ranges a frame: 514 such passes. The same pieces are hashed either way;
 /// a piece hashed when it need not be, or not hashed when it should, costs
 /// a fetch that finds nothing and loses no shader write.
@@ -3379,7 +3388,7 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            list.Dispatch(run.pieces, 1, 1);
                         }
                     }
                     list.Close()?;
@@ -3483,7 +3492,7 @@ impl Host {
                             r.shadow.buffer.GetGPUVirtualAddress(),
                         );
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        list.Dispatch(r.span.pieces, 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;

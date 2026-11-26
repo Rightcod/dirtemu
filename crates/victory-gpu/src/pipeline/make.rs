@@ -152,11 +152,10 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
-        super::recipe::record(p);
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        wait(p);
     }
     p.made.get()?.as_ref()
 }
@@ -191,7 +190,8 @@ fn shared_budget() -> bool {
 }
 
 /// Waits for `p` while frame `frame` has budget left.
-fn wait(p: &Pending, frame: u64) {
+fn wait(p: &Pending) {
+    let frame = crate::queue::presented();
     let budget = wait_budget(p.screen);
     if budget.is_zero() {
         return;
@@ -493,6 +493,26 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pacing_ticks_do_not_reset_the_pipeline_wait_budget() {
+        let budget = wait_budget(false);
+        if budget.is_zero() || budget > Duration::from_secs(2) {
+            return;
+        }
+        let pending = Pending::new(Vec::new(), None);
+        let shown = crate::queue::presented();
+        wait(&pending);
+        let null = std::ptr::null();
+        crate::frame::set_interval(null, null, 1000, 1, 0);
+        let mut token = 0;
+        crate::frame::wait(null, 0, 2, std::ptr::null(), 2, &mut token);
+        crate::frame::wait(null, 0, 2, std::ptr::null(), 2, &mut token);
+        assert_eq!(crate::queue::presented(), shown);
+        let started = Instant::now();
+        wait(&pending);
+        assert!(started.elapsed() < budget / 2);
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).

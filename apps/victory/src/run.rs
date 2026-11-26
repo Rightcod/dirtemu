@@ -12,6 +12,7 @@ pub fn run(
     execute: bool,
     console: Console,
     precompile: bool,
+    used_only: bool,
     record_pipelines: bool,
 ) -> Result<()> {
     use std::sync::Arc;
@@ -36,7 +37,7 @@ pub fn run(
         crate::precompile::record(&cfg, hash.as_str(), console)?;
     }
     if precompile {
-        crate::precompile::prepare(&cfg, exe, hash.as_str(), console, None, None)?;
+        crate::precompile::prepare(&cfg, exe, hash.as_str(), console, None, None, used_only)?;
     }
     let image = victory_loader::load(&prepared, &images)?;
     // The program is mapped from the copy `load` wrote: the file's bytes
@@ -370,6 +371,7 @@ pub fn run(
     _: bool,
     _: bool,
     _: Console,
+    _: bool,
     _: bool,
     _: bool,
 ) -> Result<()> {

@@ -142,28 +142,35 @@ pub(crate) fn cards() -> bool {
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
+/// Override the profile with `VICTORY_CARD_BUFFERS_MIN_MB` and
+/// `VICTORY_CARD_BUFFERS_MB`. Allocations still require DXGI budget headroom.
 /// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
 /// 1,650 MB of the card's budget free.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
+        let mb = |name: &str| {
             std::env::var(name)
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok())
-                .unwrap_or(default)
-                << 20
+                .and_then(|value| value.checked_mul(1 << 20))
         };
-        let mut least = mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20);
-        let mut most = mb("VICTORY_CARD_BUFFERS_MB", 512);
         let limits = crate::console::limits();
-        if limits.card_buffers_bytes > 0 {
-            // The profile's cap is the ceiling; an explicit smaller setting
-            // still lowers it.
-            most = most.min(limits.card_buffers_bytes);
-            least = least.max(limits.card_min_bytes).min(most);
-        }
+        let default_most = if limits.card_buffers_bytes == 0 {
+            512 << 20
+        } else {
+            limits.card_buffers_bytes
+        };
+        let most = mb("VICTORY_CARD_BUFFERS_MB").unwrap_or(default_most);
+        let least = mb("VICTORY_CARD_BUFFERS_MIN_MB")
+            .unwrap_or(limits.card_min_bytes.max(16 << 20))
+            .max(1 << 20)
+            .min(most);
+        tracing::info!(
+            min_mb = least >> 20,
+            max_mb = most >> 20,
+            "buffer copies in GPU memory"
+        );
         (least, most)
     })
 }
@@ -226,9 +233,16 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     // queue's own rule (`resource::room`: nine tenths of the budget) counts
     // them, so the card's use stays where it was and the textures' share
     // shrinks by the copies' bytes, at most `card_limits`' second number.
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
-    {
+    let most = if let Some([budget, used, ..]) = host.video_memory() {
+        if used.saturating_add(size) > budget / 10 * 8 {
+            return None;
+        }
+        most
+    } else {
+        let profile = crate::console::limits().card_buffers_bytes;
+        most.min(if profile == 0 { 512 << 20 } else { profile })
+    };
+    if size > most {
         return None;
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
