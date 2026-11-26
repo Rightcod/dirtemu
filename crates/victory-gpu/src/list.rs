@@ -201,6 +201,9 @@ impl Detached {
     }
 
     pub(crate) fn release_tables(&mut self) {
+        if std::env::var_os("VICTORY_EARLY_TABLES").is_some_and(|v| v == "0") {
+            return;
+        }
         self._state.tables_done();
     }
 }

@@ -216,6 +216,12 @@ impl LateDlls {
         show: impl Fn(&str, victory_loader::BindReport),
     ) -> Result<Option<usize>> {
         use victory_hle::runtime::{forget_image, image_named, set_image_path};
+        if std::env::var_os("VICTORY_DISABLE_UPSCALER").is_some_and(|v| v != "0")
+            && file.to_ascii_lowercase().contains("amd_fidelityfx_upscaler")
+        {
+            println!("upscaler       {file} disabled (VICTORY_DISABLE_UPSCALER)");
+            return Ok(None);
+        }
         // Waits while another thread initialises a DLL; a `DllMain` that
         // loads another DLL re-enters.
         self.lock.hold(|| {
