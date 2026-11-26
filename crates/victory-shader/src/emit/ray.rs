@@ -104,6 +104,13 @@ fn automatic_bvh_profile() -> RayProfile {
     AUTO_BVH_PROFILE.get().copied().unwrap_or(RayProfile::Full)
 }
 
+pub fn automatic_bvh_profile_for_adapter(vendor: u32, device: u32) -> RayProfile {
+    match (vendor, device) {
+        (0x1002, 0x67df) => RayProfile::StaticMiss,
+        _ => RayProfile::Full,
+    }
+}
+
 pub fn bvh_profile() -> RayProfile {
     resolve_profile(requested_bvh_profile(), automatic_bvh_profile())
 }
@@ -262,6 +269,29 @@ mod tests {
         }
         assert_eq!(
             resolve_profile(BvhRequest::Auto, RayProfile::Limited(0)),
+            RayProfile::Full
+        );
+    }
+
+    #[test]
+    fn polaris_rx570_uses_static_miss_only_in_the_automatic_profile() {
+        assert_eq!(
+            automatic_bvh_profile_for_adapter(0x1002, 0x67df),
+            RayProfile::StaticMiss
+        );
+        assert_eq!(
+            automatic_bvh_profile_for_adapter(0x1002, 0x67c4),
+            RayProfile::Full
+        );
+        assert_eq!(
+            automatic_bvh_profile_for_adapter(0x10de, 0x67df),
+            RayProfile::Full
+        );
+        assert_eq!(
+            resolve_profile(
+                explicit(RayProfile::Full),
+                automatic_bvh_profile_for_adapter(0x1002, 0x67df),
+            ),
             RayProfile::Full
         );
     }

@@ -644,6 +644,27 @@ fn create() -> windows::core::Result<Host> {
                 "the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)"
             );
         }
+        let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
+            .ok();
+        if let Some(adapter) = &adapter {
+            match adapter.GetDesc1() {
+                Ok(desc) => {
+                    let profile = victory_shader::emit::automatic_bvh_profile_for_adapter(
+                        desc.VendorId,
+                        desc.DeviceId,
+                    );
+                    let _ = victory_shader::emit::set_auto_bvh_profile(profile);
+                    tracing::info!(
+                        vendor = format_args!("{:#x}", desc.VendorId),
+                        device = format_args!("{:#x}", desc.DeviceId),
+                        profile = profile.cache_key(),
+                        "automatic BVH profile selected"
+                    );
+                }
+                Err(error) => tracing::warn!(%error, "cannot query the host adapter description"),
+            }
+        }
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32
         let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
@@ -686,9 +707,6 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-            .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
-            .ok();
         tracing::info!("host D3D12 device ready");
         let budget = crate::console::limits();
         tracing::info!(

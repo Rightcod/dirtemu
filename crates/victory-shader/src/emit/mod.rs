@@ -120,7 +120,7 @@ pub use profile::{
     ResolvedShaderProfile, ShaderProfile, ShaderProfileRequest, configure_shader_profile,
     resolved_shader_profile, set_host_shader_model,
 };
-pub use ray::{RayProfile, bvh_profile, set_auto_bvh_profile};
+pub use ray::{RayProfile, automatic_bvh_profile_for_adapter, bvh_profile, set_auto_bvh_profile};
 pub use rect::rect_list_gs;
 pub use sampler::StaticSampler;
 pub use shader::{

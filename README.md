@@ -90,7 +90,7 @@ see `victory.example.toml` and `docs/architecture.md`.
 |---|---|
 | `VICTORY_SHADER_PROFILE=auto/sm65/sm66` | select shader translation profile; auto uses device capability |
 | `VICTORY_MESH_FALLBACK=auto/off/on` | select mesh emulation; auto uses it when mesh shaders are unavailable |
-| `VICTORY_BVH_PROFILE=auto/full/off/low/static-miss/limited:N` | BVH/RT workload profile; `low` maps to `StaticMiss` |
+| `VICTORY_BVH_PROFILE=auto/full/off/low/static-miss/limited:N` | BVH/RT workload profile; `low` maps to `StaticMiss`, and `auto` selects it on RX 570 |
 | `VICTORY_BVH_BUDGET=N` | numeric budget for `limited` |
 | `VICTORY_AMBIENT_FALLBACK=off/auto/0.0..1.0` | constant indirect-light fallback; auto enables 0.2 on Polaris |
 | `VICTORY_D3D12_DRED=1` | report commands in flight on GPU failure |
