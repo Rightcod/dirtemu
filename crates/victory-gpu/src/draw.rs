@@ -174,6 +174,7 @@ pub(crate) struct State {
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
+    host_targets: Option<bool>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -508,18 +509,26 @@ impl State {
         self.index = view.copied().unwrap_or_default();
     }
 
-    /// Render targets and depth, set on the host list at once.
-    pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
-        let Some(host) = crate::host::host() else {
-            return;
-        };
+    pub(crate) fn set_targets(&mut self, _list: &HostList, handles: &[u64], depth: u64) {
         self.target_handles.clear();
         self.target_handles.extend_from_slice(handles);
         self.depth_handle = depth;
         self.targets_set = true;
+        self.host_targets = None;
+        self.targets.clear();
+        self.depth = 0;
+    }
+
+    fn bind_targets(&mut self, list: &HostList, depth_stencil: bool) {
+        if !self.targets_set || self.host_targets == Some(depth_stencil) {
+            return;
+        }
+        let Some(host) = crate::host::host() else {
+            return;
+        };
         self.targets.clear();
         let mut rtvs = Vec::new();
-        for &h in handles {
+        for &h in &self.target_handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
                     handle = format_args!("{h:#x}"),
@@ -549,17 +558,20 @@ impl State {
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
-        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
-            let texture = crate::resource::host_resource(record.resource)?;
-            self.depth = record.resource as usize;
-            self.depth_state = depth_state(texture, record.depth_desc().as_ref());
-            if crate::resource::depth_and_unordered(record.resource) {
-                crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
-            }
-            #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
-        });
+        let dsv = depth_stencil
+            .then(|| crate::descriptor::dsv_record(self.depth_handle))
+            .flatten()
+            .and_then(|record| {
+                let texture = crate::resource::host_resource(record.resource)?;
+                self.depth = record.resource as usize;
+                self.depth_state = depth_state(texture, record.depth_desc().as_ref());
+                if crate::resource::depth_and_unordered(record.resource) {
+                    crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
+                }
+                #[cfg(feature = "diagnostics")]
+                crate::capture::note_target(record.resource);
+                Some(host.dsv(texture, record.depth_desc().as_ref()))
+            });
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -569,6 +581,7 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
+        self.host_targets = Some(depth_stencil);
     }
 
     /// Viewports, scissors, the blend factor and the stencil reference: set
@@ -624,6 +637,7 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.host_targets = None;
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -825,6 +839,7 @@ impl State {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");
         }
+        self.bind_targets(list, p.depth_stencil);
         if !self.bind(list, p, false) {
             return false;
         }
@@ -925,7 +940,7 @@ impl State {
         }
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
-        let tested = if !compute && self.depth_state == DEPTH_READ {
+        let tested = if !compute && p.depth_stencil && self.depth_state == DEPTH_READ {
             self.depth
         } else {
             0
@@ -2941,4 +2956,119 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     });
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestTexture(This);
+
+    impl TestTexture {
+        fn new(width: u64, height: u32, format: i32, flags: i32) -> Self {
+            let properties = [1u32, 0, 0, 1, 1];
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: width,
+                Height: height,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT(format),
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: D3D12_RESOURCE_FLAGS(flags),
+                ..Default::default()
+            };
+            let iid = crate::object::guid(
+                0x696442be,
+                0xa72e,
+                0x4059,
+                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+            );
+            let mut resource = std::ptr::null();
+            assert_eq!(
+                crate::resource::create_committed(
+                    std::ptr::null(),
+                    std::ptr::from_ref(&properties).cast(),
+                    0,
+                    std::ptr::from_ref(&desc).cast(),
+                    0,
+                    std::ptr::null(),
+                    &iid,
+                    &mut resource,
+                ),
+                crate::object::S_OK,
+            );
+            Self(resource)
+        }
+    }
+
+    impl Drop for TestTexture {
+        fn drop(&mut self) {
+            unsafe {
+                let table = *self.0.cast::<*const *const ()>();
+                let release: extern "system" fn(This) -> u32 = std::mem::transmute(*table.add(2));
+                release(self.0);
+            }
+        }
+    }
+
+    #[test]
+    fn unused_depth_view_is_deferred_and_rebound_when_pipeline_usage_changes() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host GPU; skipped");
+            return;
+        };
+        let large = TestTexture::new(1920, 1080, 28, 1);
+        let small = TestTexture::new(1280, 720, 28, 1);
+        let depth = TestTexture::new(1280, 720, 40, 2);
+        let mut large_view = [0u64; 14];
+        let mut small_view = [0u64; 14];
+        let mut depth_view = [0u64; 14];
+        let large_handle = large_view.as_mut_ptr() as u64;
+        let small_handle = small_view.as_mut_ptr() as u64;
+        let depth_handle = depth_view.as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(std::ptr::null(), large.0, std::ptr::null(), large_handle);
+        crate::descriptor::create_rtv(std::ptr::null(), small.0, std::ptr::null(), small_handle);
+        crate::descriptor::create_dsv(std::ptr::null(), depth.0, std::ptr::null(), depth_handle);
+        let list = host.new_list().expect("host list");
+        let mut state = State::default();
+        state.set_targets(&list, &[large_handle], depth_handle);
+        assert_eq!(state.host_targets, None);
+        assert_eq!(state.depth, 0);
+        state.bind_targets(&list, false);
+        assert_eq!(state.host_targets, Some(false));
+        assert_eq!(state.depth, 0);
+        unsafe { host.device.GetDeviceRemovedReason() }.expect("unused mismatched DSV was bound");
+
+        state.set_targets(&list, &[small_handle], depth_handle);
+        state.bind_targets(&list, true);
+        assert_eq!(state.depth, depth.0 as usize);
+        assert_eq!(state.host_targets, Some(true));
+        state.bind_targets(&list, false);
+        assert_eq!(state.depth, 0);
+        assert_eq!(state.host_targets, Some(false));
+        state.bind_targets(&list, true);
+        assert_eq!(state.depth, depth.0 as usize);
+
+        let continued = host.new_list().expect("continued list");
+        state.replay(&continued);
+        assert_eq!(state.host_targets, None);
+        assert_eq!(state.depth, 0);
+        state.bind_targets(&continued, true);
+        assert_eq!(state.depth, depth.0 as usize);
+        state.set_targets(&continued, &[large_handle], depth_handle);
+        state.bind_targets(&continued, false);
+        assert_eq!(state.depth, 0);
+        list.close();
+        continued.close();
+        host.execute(&[&list, &continued]);
+        unsafe { host.device.GetDeviceRemovedReason() }.expect("target binding removed the device");
+        assert!(
+            host.log_messages().is_none(),
+            "target binding validation error"
+        );
+    }
 }

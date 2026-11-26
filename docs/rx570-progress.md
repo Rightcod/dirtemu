@@ -1,6 +1,6 @@
 # RX 570 progress — 2026-11-26
 
-Status: initialization and visible menus work on the tested machine. World rendering and stability are not yet working reliably; a black screen, long stalls and the title watchdog are still under investigation. The presentation counter is not evidence of playable world frame rates.
+Status: initialization, visible menus and entry into Game Running work on the tested machine. World rendering and stability are not yet working reliably; the observed world is black at roughly 700 ms per frame, with later driver faults still under investigation. The presentation counter is not evidence of playable world frame rates.
 
 ## Compatibility fixes
 
@@ -11,6 +11,11 @@ Status: initialization and visible menus work on the tested machine. World rende
 - Add the GUID functions requested through rpcrt4, the retail console identifier, optional title frame-rate settings and opt-in XMem tracing retained from the preceding investigation.
 - Remove the VICTORY_DISABLE_UPSCALER DLL-loading block. The title still uses FSR when its provider is refused; its jitter phase query leaves zero and the first dispatch divides by zero at image RVA 0x28f03e8. With the provider loaded, the observed 1280-to-1920 query returns 18 phases and a non-NULL context.
 - Create capture directories and support RGBA/BGRA typeless readbacks.
+- Defer output-merger targets until the graphics pipeline is known, and bind its depth view only when depth or stencil is enabled. The D3D12 debug layer identified a 1920x1080 RTV paired with an unused 1280x720 DSV as a device-removing invalid call.
+- Copy the ambient light UAV into the shader-visible descriptor heap before clearing it. The CPU and GPU clear descriptors must be identical.
+- Use RGBA16_FLOAT for R9G9B9E5 render/UAV targets on adapters that cannot write the packed HDR format, with consistent pipeline and view formats.
+- Preserve output register rows and component masks in the mesh fallback vertex wrapper. Repacking every semantic into a new register breaks linkage with the pixel shader. Overlapping vertex/primitive outputs remain explicitly unsupported.
+- Keep launcher caches, data, logs and TEMP/TMP on the repository drive by default.
 
 The compositor and related retail-plane handling were adapted from the Pareto snapshot in caruno-git/Americas-Shim. RPC and frame-rate work were adapted from the local cool_fox and VIctory-7900XTX references. Existing source attribution and the repository licence apply.
 
@@ -21,8 +26,11 @@ The compositor and related retail-plane handling were adapted from the Pareto sn
 - Four BC3 decoder tests pass.
 - The display compositor GPU test reads back the expected transparent, half-transparent and opaque pixels after scaling.
 - The console-instruction execution test passes with crash reporting disabled.
+- Five further regressions pass on the RX 570 with the D3D12 debug layer: mismatched unused depth targets, depth/stencil enable flags, ambient clear pixel readback, typed format capabilities, and HDR RTV/UAV creation.
 - The game reaches its settings UI and loading screens with two-plane composition active.
-- The FSR-enabled run has a valid jitter phase count; it later stalls and triggers the title watchdog at image RVA 0x23cf683. This is a separate unresolved failure.
+- Seven mesh fallback tests pass, including packed TEXCOORD components, system semantics, emitted storeOutput semantic IDs and vertex/primitive collisions.
+- After the output-merger and clear fixes, the game entered Game Running and stayed alive for about ten minutes with no recurrence of D3D12 validation IDs 728/646/599/38. It then crashed in the AMD driver while recording CopyTextureRegion. The new mesh-wrapper fix still needs a full game run.
+- The Series S profile reaches its 2.5 GiB host-copy and 512 MiB streamed-texture budgets and refuses further resources. The tested run had about 1 GiB system RAM available, substantial paging and roughly 14 GiB process private commit. These observations do not prove VRAM exhaustion.
 
 ## Running
 

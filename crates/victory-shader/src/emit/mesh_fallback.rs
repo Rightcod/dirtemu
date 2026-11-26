@@ -188,9 +188,23 @@ pub(crate) fn vertex_shader(
         return Err("mesh outputs beyond a vertex shader's 32 rows");
     }
     let mut seen = std::collections::HashSet::new();
+    let mut occupied = [0u8; 32];
     for e in outputs.iter().chain(prims) {
         if !seen.insert((e.kind, e.name.clone(), e.index)) {
             return Err("a vertex and primitive output with the same semantic");
+        }
+        if e.cols == 0 || u32::from(e.col) + u32::from(e.cols) > 4 {
+            return Err("a mesh output outside its register components");
+        }
+        if let Some(row) = e.row {
+            let used = occupied
+                .get_mut(row as usize)
+                .ok_or("mesh outputs beyond a vertex shader's 32 rows")?;
+            let mask = ((1u8 << e.cols) - 1) << e.col;
+            if *used & mask != 0 {
+                return Err("overlapping mesh outputs in the vertex shader signature");
+            }
+            *used |= mask;
         }
     }
     let mut s = Shader::new(false, profile);
@@ -199,9 +213,7 @@ pub(crate) fn vertex_shader(
         system_input("SV_InstanceID", 2, 1),
     ];
     s.outputs = outputs.iter().chain(prims).cloned().collect();
-    for (row, e) in s.outputs.iter_mut().enumerate() {
-        e.row = Some(row as u32);
-        e.col = 0;
+    for e in &mut s.outputs {
         e.usage = 0;
     }
     let handle = s.root_srv_handle(SLOT_MESH_OUTPUT);
@@ -337,7 +349,7 @@ mod tests {
             code: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
         };
         let signature = super::super::container::signature(&outputs, false);
-        let primitive = super::super::container::signature(&[element("PRIMDATA", 0, 0, 4)], false);
+        let primitive = super::super::container::signature(&[element("PRIMDATA", 0, 2, 4)], false);
         let bytes = crate::dxbc::build(&[(FourCC::OSG1, &signature), (FourCC::PSG1, &primitive)]);
         let container = Container::parse(&bytes).unwrap();
         let p = ir::build(&native.code, native.wave64, native.vgprs)?;
@@ -411,7 +423,7 @@ mod tests {
             code: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
         };
         let signature = super::super::container::signature(&outputs, false);
-        let primitive = super::super::container::signature(&[element("PRIMDATA", 0, 0, 4)], false);
+        let primitive = super::super::container::signature(&[element("PRIMDATA", 0, 2, 4)], false);
         let bytes = crate::dxbc::build(&[(FourCC::OSG1, &signature), (FourCC::PSG1, &primitive)]);
         let container = Container::parse(&bytes).unwrap();
         let p = ir::build(&native.code, native.wave64, native.vgprs)?;
@@ -528,6 +540,100 @@ mod tests {
         let program =
             crate::DxilProgram::parse(container.part(FourCC::DXIL).unwrap().data).unwrap();
         assert_eq!(program.kind, ShaderKind::Mesh);
+    }
+
+    fn wrapper(outputs: &[SigElement], prims: &[SigElement]) -> Result<Vec<u8>, &'static str> {
+        let mesh = MeshIo {
+            outputs: vec![],
+            clip_cntl: 0,
+            threads: 32,
+            max_vertices: 3,
+            max_primitives: 1,
+            topology: 2,
+            lds_bytes: 0,
+        };
+        let layout = Layout::new(outputs, prims, &mesh)?;
+        vertex_shader(&layout, outputs, prims, super::super::ShaderProfile::Sm65)
+    }
+
+    #[test]
+    fn packed_outputs_keep_the_pixel_shader_registers_and_components() {
+        let mut uv1 = element("TEXCOORD", 0, 1, 2);
+        uv1.index = 1;
+        uv1.col = 2;
+        let mut clip1 = element("SV_ClipDistance", 6, 5, 2);
+        clip1.index = 1;
+        clip1.col = 2;
+        let outputs = vec![
+            element("SV_Position", 3, 0, 4),
+            element("TEXCOORD", 0, 1, 2),
+            uv1,
+            element("COLOR", 0, 3, 4),
+            element("SV_ClipDistance", 6, 5, 2),
+            clip1,
+            element("SV_CullDistance", 7, 6, 1),
+        ];
+        let prims = vec![element("PRIMDATA", 0, 4, 4)];
+        let bytes = wrapper(&outputs, &prims).unwrap();
+        let container = Container::parse(&bytes).unwrap();
+        let emitted = super::super::signature(container.part(FourCC::OSG1).unwrap().data).unwrap();
+        let expected: Vec<_> = outputs.iter().chain(&prims).collect();
+        let program =
+            crate::DxilProgram::parse(container.part(FourCC::DXIL).unwrap().data).unwrap();
+        let bitcode = Bitcode::parse(program.bitcode);
+        let stores: Vec<_> = expected
+            .iter()
+            .enumerate()
+            .flat_map(|(id, e)| (0..e.cols).map(move |col| (id as u64, 0, u64::from(col))))
+            .collect();
+        assert_eq!(bitcode.output_stores(), stores);
+        assert_eq!(emitted.len(), expected.len());
+        for original in expected {
+            let got = emitted
+                .iter()
+                .find(|e| e.name == original.name && e.index == original.index)
+                .unwrap();
+            assert_eq!((got.kind, got.comp), (original.kind, original.comp));
+            assert_eq!(
+                (got.row, got.col, got.cols),
+                (original.row, original.col, original.cols),
+                "{}{}",
+                original.name,
+                original.index
+            );
+        }
+        #[cfg(windows)]
+        if let Ok(mut validator) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            validator.validate(&mut bytes.clone()).unwrap();
+        }
+    }
+
+    #[test]
+    fn vertex_and_primitive_outputs_share_only_disjoint_components() {
+        let outputs = vec![
+            element("SV_Position", 3, 0, 4),
+            element("TEXCOORD", 0, 1, 2),
+        ];
+        let mut primitive = element("PRIMDATA", 0, 1, 2);
+        primitive.col = 2;
+        let bytes = wrapper(&outputs, &[primitive.clone()]).unwrap();
+        let container = Container::parse(&bytes).unwrap();
+        let emitted = super::super::signature(container.part(FourCC::OSG1).unwrap().data).unwrap();
+        assert_eq!(
+            (emitted[1].row, emitted[1].col, emitted[1].cols),
+            (Some(1), 0, 2)
+        );
+        assert_eq!(
+            (emitted[2].row, emitted[2].col, emitted[2].cols),
+            (Some(1), 2, 2)
+        );
+        primitive.col = 1;
+        assert_eq!(
+            wrapper(&outputs, &[primitive]).unwrap_err(),
+            "overlapping mesh outputs in the vertex shader signature"
+        );
     }
 
     #[test]
@@ -746,6 +852,26 @@ mod tests {
             }
         }
 
+        fn output_stores(&self) -> Vec<(u64, u64, u64)> {
+            let mut next = self.globals + self.funcs.len() as u32 + self.consts.len() as u32;
+            let mut stores = Vec::new();
+            for record in &self.records {
+                let id = record.id.unwrap_or(next);
+                next = id + u32::from(record.id.is_some());
+                if record.code != 34 {
+                    continue;
+                }
+                let callee = id - record.ops[3] as u32;
+                let name = &self.funcs[(callee - self.globals) as usize];
+                if name.starts_with("dx.op.storeOutput.") {
+                    let value =
+                        |n: usize| self.eval(id - record.ops[n] as u32, 0, 0, &mut HashMap::new());
+                    stores.push((value(5), value(6), value(7)));
+                }
+            }
+            stores
+        }
+
         fn first_raw_load_address(&self) -> u32 {
             for record in &self.records {
                 if record.code != 34 {
@@ -826,7 +952,7 @@ mod tests {
             element("SV_Position", 3, 0, 4),
             element("TEXCOORD", 0, 1, 1),
         ];
-        let prims = vec![element("PRIMDATA", 0, 0, 4)];
+        let prims = vec![element("PRIMDATA", 0, 2, 4)];
         let mesh = MeshIo {
             outputs: vec![],
             clip_cntl: 0,

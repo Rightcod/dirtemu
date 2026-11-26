@@ -1,8 +1,8 @@
 # ztrx launcher: runs the game for normal play (no scripted presses, no capture).
 param(
     [Parameter(Mandatory = $true)][string]$Game,
-    [string]$Cache = "$env:LOCALAPPDATA\ztrx\cache",
-    [string]$Data = "$env:LOCALAPPDATA\ztrx\data",
+    [string]$Cache = "$PSScriptRoot\..\cache",
+    [string]$Data = "$PSScriptRoot\..\data",
     [string]$Exe = "$PSScriptRoot\..\target\release\victory.exe",
     [string]$Console = "series-s"
 )
@@ -24,8 +24,12 @@ foreach ($pair in @(
         Set-Item "Env:$($pair[0])" $pair[1]
     }
 }
-New-Item -ItemType Directory -Force $Cache, $Data | Out-Null
-$env:VICTORY_CACHE_DIR = $Cache
-$env:VICTORY_DATA_DIR = $Data
-& $Exe run $Game --console $Console --execute 2>&1 | Out-File "$env:TEMP\ztrx.log" -Encoding utf8
-Write-Host "Exited with $LASTEXITCODE; log: $env:TEMP\ztrx.log"
+$TempPath = Join-Path $Cache "temp"
+New-Item -ItemType Directory -Force $Cache, $Data, $TempPath | Out-Null
+$env:TEMP = (Resolve-Path -LiteralPath $TempPath).Path
+$env:TMP = $env:TEMP
+$env:VICTORY_CACHE_DIR = (Resolve-Path -LiteralPath $Cache).Path
+$env:VICTORY_DATA_DIR = (Resolve-Path -LiteralPath $Data).Path
+$LogPath = Join-Path $Cache "ztrx.log"
+& $Exe run $Game --console $Console --execute 2>&1 | Out-File $LogPath -Encoding utf8
+Write-Host "Exited with $LASTEXITCODE; log: $LogPath"

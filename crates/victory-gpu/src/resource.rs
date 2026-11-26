@@ -357,14 +357,14 @@ fn packed_target_supported(support1: i32, support2: i32) -> bool {
 /// itself in the 16-bit format are skipped ([`stands_in`]); convert them
 /// if a pass turns out to need one.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const STAND_INS: [(u32, u32); 2] = [(86, 28), (115, 28)];
+    const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 10)];
     let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
         return format;
     };
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::*;
-        static REFUSED: std::sync::OnceLock<[bool; 2]> = std::sync::OnceLock::new();
+        static REFUSED: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
         let refused = REFUSED.get_or_init(|| {
             STAND_INS.map(|(f, _)| {
                 let Some(host) = crate::host::host() else {
@@ -387,7 +387,8 @@ pub(crate) fn target_format(format: u32) -> u32 {
                 if refused {
                     tracing::info!(
                         format = f,
-                        "the host does not render to this format: 8-bit RGBA stands in"
+                        host_format = STAND_INS.iter().find(|&&(source, _)| source == f).unwrap().1,
+                        "the host does not render to this format: a compatible colour format stands in"
                     );
                 }
                 refused
@@ -3932,7 +3933,7 @@ float4 lit() : SV_Target { return 1.0; }
         let Some(host) = crate::host::host() else {
             return;
         };
-        for format in [86, 115] {
+        for (format, fallback) in [(86, 28), (115, 28), (67, 10)] {
             let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
                 Format: DXGI_FORMAT(format),
                 ..Default::default()
@@ -3948,10 +3949,62 @@ float4 lit() : SV_Target { return 1.0; }
             let expected = if packed_target_supported(support.Support1.0, support.Support2.0) {
                 format as u32
             } else {
-                28
+                fallback
             };
             assert_eq!(target_format(format as u32), expected);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shared_exponent_render_target_has_host_views() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipping HDR target regression: no D3D12 device");
+            return;
+        };
+        let desc = ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 4,
+            height: 4,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 67,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 5,
+        };
+        let texture =
+            host_texture(&desc, 0, std::ptr::null()).expect("HDR target with RTV and UAV");
+        let actual = unsafe { texture.GetDesc() };
+        assert_eq!(actual.Format.0 as u32, target_format(67));
+        let heap: ID3D12DescriptorHeap = unsafe {
+            host.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        host.rtv(Some(&texture), None);
+        unsafe {
+            host.device.CreateUnorderedAccessView(
+                &texture,
+                None::<&ID3D12Resource>,
+                Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT(target_format(67) as i32),
+                    ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                    ..Default::default()
+                }),
+                heap.GetCPUDescriptorHandleForHeapStart(),
+            );
+            host.device.GetDeviceRemovedReason().unwrap();
+        }
+        assert!(host.log_messages().is_none());
     }
 
     #[cfg(windows)]

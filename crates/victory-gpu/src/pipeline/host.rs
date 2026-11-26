@@ -93,6 +93,10 @@ impl Default for GraphicsState {
 }
 
 impl GraphicsState {
+    fn uses_depth_stencil(&self) -> bool {
+        self.depth.DepthEnable.as_bool() || self.depth.StencilEnable.as_bool()
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -330,6 +334,7 @@ pub(crate) struct HostPipeline {
     pub(crate) compute: bool,
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
+    pub(crate) depth_stencil: bool,
     pub(crate) mesh_fallback: Option<MeshFallbackPipeline>,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
@@ -517,6 +522,7 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
+                depth_stencil: false,
                 mesh_fallback: None,
                 pso,
                 root,
@@ -621,6 +627,7 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
+                depth_stencil: g.uses_depth_stencil(),
                 mesh_fallback: Some(MeshFallbackPipeline {
                     compute: compute_pso,
                     compute_root: compute_root?,
@@ -667,6 +674,7 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
+                depth_stencil: g.uses_depth_stencil(),
                 mesh_fallback: None,
                 pso,
                 root,
@@ -789,6 +797,7 @@ impl HostPipeline {
         Some(HostPipeline {
             compute: false,
             mesh: false,
+            depth_stencil: g.uses_depth_stencil(),
             mesh_fallback: None,
             pso,
             root,
@@ -946,9 +955,9 @@ fn root_dwords(params: &[D3D12_ROOT_PARAMETER1]) -> u64 {
         .iter()
         .map(|parameter| match parameter.ParameterType {
             // SAFETY: the union holds constants for this parameter type.
-            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS => u64::from(unsafe {
-                parameter.Anonymous.Constants.Num32BitValues
-            }),
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS => {
+                u64::from(unsafe { parameter.Anonymous.Constants.Num32BitValues })
+            }
             D3D12_ROOT_PARAMETER_TYPE_CBV
             | D3D12_ROOT_PARAMETER_TYPE_SRV
             | D3D12_ROOT_PARAMETER_TYPE_UAV => 2,
@@ -1182,7 +1191,10 @@ fn signature_layout(
                     .iter()
                     .position(|other| other == alias)
                     .expect("the alias was collected");
-                (alias_base + at as u32, alias.class == DescriptorClass::Sampler)
+                (
+                    alias_base + at as u32,
+                    alias.class == DescriptorClass::Sampler,
+                )
             })
             .collect();
     }
@@ -1250,6 +1262,21 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    #[test]
+    fn depth_stencil_binding_follows_both_enable_flags() {
+        let mut g = GraphicsState::default();
+        for (depth, stencil, needed) in [
+            (false, false, false),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            g.depth.DepthEnable = depth.into();
+            g.depth.StencilEnable = stencil.into();
+            assert_eq!(g.uses_depth_stencil(), needed);
+        }
+    }
 
     #[test]
     fn mesh_fallback_primitives_fit_the_group_record() {
@@ -1353,8 +1380,8 @@ mod tests {
     use std::sync::OnceLock;
 
     use victory_shader::HwStage;
-    use victory_shader::emit::{MeshFallback, ShaderProfile};
     use victory_shader::RootType;
+    use victory_shader::emit::{MeshFallback, ShaderProfile};
 
     /// The adapter's highest shader model (`D3D_SHADER_MODEL`).
     fn highest_shader_model(device: &ID3D12Device) -> u32 {
@@ -1382,8 +1409,7 @@ mod tests {
         };
         // SAFETY: plain DXGI and D3D12 object creation.
         unsafe {
-            let factory: IDXGIFactory4 =
-                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
             let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
             let mut device: Option<ID3D12Device> = None;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
@@ -1562,10 +1588,7 @@ mod tests {
             HwStage::Ps,
             ShaderProfile::Sm65,
             Vec::new(),
-            &[
-                (DescriptorClass::Srv, 2),
-                (DescriptorClass::Sampler, 3),
-            ],
+            &[(DescriptorClass::Srv, 2), (DescriptorClass::Sampler, 3)],
             false,
         );
         let signature = signature_layout(
@@ -1649,10 +1672,7 @@ mod tests {
                 HwStage::Ps,
                 ShaderProfile::Sm65,
                 ps,
-                &[
-                    (DescriptorClass::Srv, 2),
-                    (DescriptorClass::Sampler, 3),
-                ],
+                &[(DescriptorClass::Srv, 2), (DescriptorClass::Sampler, 3)],
                 false,
             ),
         );
@@ -1731,9 +1751,9 @@ mod tests {
                     ..Default::default()
                 })
                 .expect("view heap");
-            let step = device.GetDescriptorHandleIncrementSize(
-                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            ) as usize;
+            let step = device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                as usize;
             let start = heap.GetCPUDescriptorHandleForHeapStart();
             device.CreateShaderResourceView(
                 &input,
@@ -1781,12 +1801,7 @@ mod tests {
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
                 .expect("allocator");
             let list: ID3D12GraphicsCommandList = device
-                .CreateCommandList(
-                    0,
-                    D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    &allocator,
-                    Some(&p.pso),
-                )
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, Some(&p.pso))
                 .expect("list");
             list.ResourceBarrier(&[
                 crate::host::transition(
@@ -1825,9 +1840,7 @@ mod tests {
             queue.ExecuteCommandLists(&[Some(
                 list.cast::<ID3D12CommandList>().expect("command list"),
             )]);
-            let fence: ID3D12Fence = device
-                .CreateFence(0, D3D12_FENCE_FLAG_NONE)
-                .expect("fence");
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
             queue.Signal(&fence, 1).expect("signal");
             while fence.GetCompletedValue() < 1 {
                 if let Err(e) = device.GetDeviceRemovedReason() {
@@ -1837,7 +1850,9 @@ mod tests {
             }
             device.GetDeviceRemovedReason().expect("device removed");
             let mut mapped = std::ptr::null_mut();
-            readback.Map(0, None, Some(&mut mapped)).expect("map output");
+            readback
+                .Map(0, None, Some(&mut mapped))
+                .expect("map output");
             let value = mapped.cast::<u32>().read();
             readback.Unmap(0, None);
             assert_eq!(value, 42, "the dispatch read alias slot 0 and wrote slot 1");

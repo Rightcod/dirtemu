@@ -325,6 +325,15 @@ fn clear(
     crate::list::ensure_state(list, resource, UNORDERED_ACCESS);
     unsafe {
         device.CreateUnorderedAccessView(host, None::<&ID3D12Resource>, Some(&view), cpu);
+        let visible = pass.gpu.GetCPUDescriptorHandleForHeapStart();
+        device.CopyDescriptorsSimple(
+            1,
+            D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: visible.ptr + (slot * pass.step) as usize,
+            },
+            cpu,
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        );
         list.list.SetDescriptorHeaps(&[Some(pass.gpu.clone())]);
         uav_barrier(list);
         match kind {
@@ -441,6 +450,86 @@ mod tests {
             dwords: 8,
             user_data: 5,
             slot,
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn clears_light_uav_and_reads_pixels_on_gpu() {
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipping light clear regression: no D3D12 device");
+            return;
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 2,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R32_UINT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    None,
+                    &mut texture,
+                )
+                .unwrap();
+        }
+        let texture = texture.unwrap();
+        let list = host.new_list().unwrap();
+        let expected = pack_r9g9b9e5(0.2, 0.196, 0.188);
+        assert!(clear(
+            &list,
+            std::ptr::null_mut(),
+            &texture,
+            &[R32_UINT, TEXTURE2D, 0, 0, 0, 0, 0, 0, 0, 0],
+            ClearKind::Uint([expected, 0, 0, 0]),
+            &[0, 0],
+        ));
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &texture,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+        }
+        let (back, footprint) =
+            crate::capture::read_back(&host.device, &list.list, &texture).unwrap();
+        assert!(host.log_messages().is_none());
+        list.close();
+        host.execute(&[&list]);
+        unsafe {
+            host.device.GetDeviceRemovedReason().unwrap();
+            let mut mapped = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut mapped)).unwrap();
+            for row in 0..2usize {
+                let start = mapped
+                    .cast::<u8>()
+                    .add(footprint.Offset as usize + row * footprint.Footprint.RowPitch as usize);
+                for column in 0..4usize {
+                    assert_eq!(
+                        start.add(column * 4).cast::<u32>().read_unaligned(),
+                        expected
+                    );
+                }
+            }
+            back.Unmap(0, None);
         }
     }
 
