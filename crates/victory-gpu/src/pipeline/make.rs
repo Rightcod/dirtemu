@@ -12,8 +12,8 @@
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //!
-//! The default budget is half a second per title frame. A pass the title
-//! runs only once and whose pipeline takes longer is lost.
+//! Screen passes can fill lighting tables once, on entry into the world.
+//! Give them a worker and wait budget of their own (Belobug, 18e57db).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -27,6 +27,7 @@ use super::host::{GraphicsState, HostPipeline};
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
+    screen: bool,
     queue_state: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
@@ -56,6 +57,10 @@ impl Pending {
                 .as_bytes(),
         );
         Pending {
+            screen: graphics.as_ref().is_some_and(|g| g.screen_pass())
+                && shaders.len() == 2
+                && shaders.iter().any(|s| s.stage == "vertex")
+                && shaders.iter().any(|s| s.stage == "pixel"),
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -72,6 +77,14 @@ impl Pending {
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+
+    pub(super) fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub(super) fn shaders(&self) -> &[Arc<Shader>] {
+        &self.shaders
+    }
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -80,7 +93,14 @@ impl Pending {
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
-        None => Some("being made".into()),
+        None => Some(
+            if p.screen {
+                "screen pass being made"
+            } else {
+                "being made"
+            }
+            .into(),
+        ),
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders
@@ -101,16 +121,20 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Waiting allowed per title frame, over all threads.
-fn wait_budget() -> Duration {
-    static BUDGET: OnceLock<Duration> = OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
+fn wait_budget(screen: bool) -> Duration {
+    static BUDGETS: OnceLock<[Duration; 2]> = OnceLock::new();
+    BUDGETS.get_or_init(|| {
+        let configured = std::env::var("VICTORY_PIPELINE_WAIT_MS")
             .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(500);
-        tracing::info!(millis, "host pipeline wait budget per frame");
-        Duration::from_millis(millis)
-    })
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        let budgets = [configured.unwrap_or(500), configured.unwrap_or(3000)];
+        tracing::info!(
+            millis = budgets[0],
+            screen_millis = budgets[1],
+            "host pipeline wait budget per frame"
+        );
+        budgets.map(Duration::from_millis)
+    })[usize::from(screen)]
 }
 
 /// Pipelines queued and not made yet.
@@ -128,6 +152,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
+        super::recipe::record(p);
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
@@ -146,7 +171,7 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.made.get().is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }
@@ -167,16 +192,18 @@ fn shared_budget() -> bool {
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
-    let budget = wait_budget();
+    let budget = wait_budget(p.screen);
     if budget.is_zero() {
         return;
     }
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
-    static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+    static SPENT: [Mutex<(u64, Duration)>; 2] =
+        [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    let spent = &SPENT[usize::from(p.screen)];
     let shared = shared_budget();
     let left = {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = spent.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
@@ -205,7 +232,7 @@ fn wait(p: &Pending, frame: u64) {
     drop(held);
     let waited = started.elapsed().min(left);
     {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = spent.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
         if spent.0 == frame {
             if shared {
@@ -267,8 +294,8 @@ impl Queue {
     }
 }
 
-static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
-static AVAILABLE: Condvar = Condvar::new();
+static QUEUES: [(Mutex<Queue>, Condvar); 2] =
+    [const { (Mutex::new(Queue::new()), Condvar::new()) }; 2];
 
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
@@ -276,13 +303,16 @@ fn start(p: &Arc<Pending>, priority: u8) {
     if p.queue_state.load(Ordering::Relaxed) >= priority {
         return;
     }
-    if !workers() {
+    let running = workers();
+    if running[0] == 0 {
         if p.queue_state.swap(MAKING, Ordering::Relaxed) == NOT_QUEUED {
             p.make();
         }
         return;
     }
-    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    let kind = usize::from(p.screen && running[1] != 0);
+    let (lock, available) = &QUEUES[kind];
+    let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
         if new {
             PEAK.fetch_max(
@@ -290,17 +320,18 @@ fn start(p: &Arc<Pending>, priority: u8) {
                 Ordering::Relaxed,
             );
         }
-        AVAILABLE.notify_one();
+        available.notify_one();
     }
 }
 
-fn next() -> Arc<Pending> {
-    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+fn next(kind: usize) -> Arc<Pending> {
+    let (lock, available) = &QUEUES[kind];
+    let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
     loop {
         if let Some(p) = queue.pop() {
             return p;
         }
-        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+        queue = available.wait(queue).unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -385,10 +416,10 @@ fn physical_cores() -> Option<usize> {
 }
 
 /// Starts the workers on first use: [`worker_count`], or `VICTORY_PIPELINE_WORKERS`.
-fn workers() -> bool {
-    static RUNNING: OnceLock<bool> = OnceLock::new();
-    *RUNNING.get_or_init(|| {
-        let mut running = false;
+fn workers() -> &'static [usize; 2] {
+    static RUNNING: OnceLock<[usize; 2]> = OnceLock::new();
+    RUNNING.get_or_init(|| {
+        let mut running = [0, 0];
         let logical = std::thread::available_parallelism().map_or(2, |n| n.get());
         let physical = physical_cores();
         let requested = std::env::var("VICTORY_PIPELINE_WORKERS").ok();
@@ -403,17 +434,11 @@ fn workers() -> bool {
             );
         }
         let workers = overridden.unwrap_or_else(|| worker_count(logical, physical));
-        tracing::info!(
-            logical,
-            physical = physical.unwrap_or(0),
-            workers,
-            overridden = overridden.is_some(),
-            "host pipeline workers"
-        );
         for i in 0..workers {
+            let kind = usize::from(i + 1 == workers && running[0] != 0);
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
+                .spawn(move || {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
                     unsafe {
@@ -421,7 +446,7 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        next().make();
+                        next(kind).make();
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -432,9 +457,17 @@ fn workers() -> bool {
             if let Err(e) = spawned {
                 tracing::warn!(error = %e, "no pipeline worker");
             } else {
-                running = true;
+                running[kind] += 1;
             }
         }
+        tracing::info!(
+            logical,
+            physical = physical.unwrap_or(0),
+            workers = running[0] + running[1],
+            screen_workers = running[1],
+            overridden = overridden.is_some(),
+            "host pipeline workers"
+        );
         running
     })
 }

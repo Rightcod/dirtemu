@@ -11,6 +11,8 @@ pub fn run(
     strict: bool,
     execute: bool,
     console: Console,
+    precompile: bool,
+    record_pipelines: bool,
 ) -> Result<()> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
@@ -29,6 +31,13 @@ pub fn run(
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    console.select();
+    if precompile || record_pipelines {
+        crate::precompile::record(&cfg, hash.as_str(), console)?;
+    }
+    if precompile {
+        crate::precompile::prepare(&cfg, exe, hash.as_str(), console, None, None)?;
+    }
     let image = victory_loader::load(&prepared, &images)?;
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
@@ -66,10 +75,6 @@ pub fn run(
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
-    victory_hle::console::set(match console {
-        Console::SeriesX => victory_hle::console::Console::SeriesX,
-        Console::SeriesS => victory_hle::console::Console::SeriesS,
-    });
     println!("console        {}", victory_hle::console::current().name());
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
@@ -144,6 +149,9 @@ pub fn run(
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    if precompile || record_pipelines {
+        victory_gpu::pipeline::save_pipeline_cache();
+    }
     println!("title exited with {code}");
     Ok(())
 }
@@ -356,6 +364,14 @@ mod tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
+pub fn run(
+    _: &Path,
+    _: Unimplemented,
+    _: bool,
+    _: bool,
+    _: Console,
+    _: bool,
+    _: bool,
+) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
 }

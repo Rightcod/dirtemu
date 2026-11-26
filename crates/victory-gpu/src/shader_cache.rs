@@ -35,9 +35,10 @@ struct Key {
     ray_profile: RayProfile,
     descriptor_alias_abi: u32,
     direct_heap_policy: u32,
+    target: [u8; 8],
 }
 
-const KEY_BYTES: usize = 32 + 1 + 1 + 8 + 4 + 4;
+const KEY_BYTES: usize = 32 + 1 + 1 + 8 + 4 + 4 + 8;
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
@@ -57,7 +58,7 @@ pub(crate) fn counts() -> (u64, u64) {
 /// What identifies this build: the BLAKE3 of our executable file and of
 /// the translation settings it runs with (the loop limit, which a
 /// diagnostics build can change at run time).
-fn build() -> &'static [u8; 32] {
+pub(crate) fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
         let exe = std::env::current_exe().and_then(std::fs::read);
@@ -124,11 +125,38 @@ pub(crate) fn host_shader(container: &[u8], mesh_fallback: bool) -> Result<HostS
         ray_profile: victory_shader::emit::bvh_profile(),
         descriptor_alias_abi: DESCRIPTOR_ALIAS_ABI,
         direct_heap_policy: DIRECT_HEAP_POLICY,
+        target: victory_shader::emit::shader_target_key(),
     };
     match CACHE.get() {
         Some(cache) => cached_variant(cache, build(), container, key, translate),
         None => translate(container),
     }
+}
+
+pub fn precompile_setup() -> Result<blake3::Hash, String> {
+    crate::host::host().ok_or("no D3D12 device for shader precompilation")?;
+    crate::descriptor::host::probe_view_limit();
+    let profile = victory_shader::emit::resolved_shader_profile()?.profile;
+    let mut key = blake3::Hasher::new();
+    key.update(build());
+    key.update(&[
+        profile.cache_encoding(),
+        u8::from(crate::mesh_fallback::enabled()),
+    ]);
+    key.update(
+        &victory_shader::emit::bvh_profile()
+            .cache_encoding()
+            .to_le_bytes(),
+    );
+    key.update(&victory_shader::emit::shader_target_key());
+    Ok(key.finalize())
+}
+
+pub fn precompile_shader(container: &[u8]) -> Result<(), String> {
+    let parsed = victory_shader::Container::parse(container).map_err(|e| e.to_string())?;
+    let programs = victory_shader::container_programs(&parsed).map_err(|e| e.to_string())?;
+    let mesh = programs.iter().any(|p| p.stage == HwStage::Ms);
+    host_shader(container, mesh && crate::mesh_fallback::enabled()).map(|_| ())
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -145,7 +173,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn version(&self) -> u32 {
         // Bump with the entry encoding and key layout.
-        4
+        5
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
@@ -171,6 +199,7 @@ fn cached(
             ray_profile: RayProfile::Full,
             descriptor_alias_abi: DESCRIPTOR_ALIAS_ABI,
             direct_heap_policy: DIRECT_HEAP_POLICY,
+            target: [0; 8],
         },
         translate,
     )
@@ -190,6 +219,7 @@ fn cached_variant(
     input.extend_from_slice(&key.ray_profile.cache_encoding().to_le_bytes());
     input.extend_from_slice(&key.descriptor_alias_abi.to_le_bytes());
     input.extend_from_slice(&key.direct_heap_policy.to_le_bytes());
+    input.extend_from_slice(&key.target);
     input.extend_from_slice(container);
     let converter = Translate {
         translate,
@@ -559,6 +589,7 @@ mod tests {
             Ok(shader())
         };
         let hardware_65 = Key {
+            target: [0; 8],
             mesh_fallback: false,
             profile: Some(ShaderProfile::Sm65),
             ray_profile: RayProfile::Full,
@@ -596,6 +627,7 @@ mod tests {
         let build = [9u8; 32];
         let runs = AtomicU64::new(0);
         let base = Key {
+            target: [0; 8],
             mesh_fallback: false,
             profile: Some(ShaderProfile::Sm65),
             ray_profile: RayProfile::Full,
@@ -638,6 +670,7 @@ mod tests {
             Ok(shader())
         };
         let base = Key {
+            target: [0; 8],
             mesh_fallback: false,
             profile: Some(ShaderProfile::Sm65),
             ray_profile: RayProfile::Full,
@@ -678,6 +711,7 @@ mod tests {
         let build = [6u8; 32];
         let runs = AtomicU64::new(0);
         let key = |profile| Key {
+            target: [0; 8],
             mesh_fallback: false,
             profile: Some(profile),
             ray_profile: RayProfile::Full,

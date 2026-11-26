@@ -6519,6 +6519,9 @@ impl Host {
             // read back at once (a saved or listed frame): then a list of
             // its own, one whose last flight has finished or a new one.
             #[cfg(feature = "diagnostics")]
+            let sample_planes = std::env::var_os("VICTORY_CAPTURE_PLANES").is_some()
+                && crate::capture::listed(frame);
+            #[cfg(feature = "diagnostics")]
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
@@ -6636,6 +6639,31 @@ impl Host {
                 list.CopyResource(&back, texture);
             }
             #[cfg(feature = "diagnostics")]
+            let sampled_planes = sample_planes.then(|| {
+                let plane = |tex: &ID3D12Resource, before: D3D12_RESOURCE_STATES| {
+                    let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                    if before != source {
+                        list.ResourceBarrier(&[transition(tex, before, source)]);
+                    }
+                    let read = crate::capture::read_back(&self.device, list, tex);
+                    if before != source {
+                        list.ResourceBarrier(&[transition(tex, source, before)]);
+                    }
+                    read
+                };
+                let base = plane(
+                    texture,
+                    if composed {
+                        state
+                    } else {
+                        D3D12_RESOURCE_STATE_COPY_SOURCE
+                    },
+                );
+                let overlay = overlay
+                    .and_then(|(tex, before)| plane(tex, D3D12_RESOURCE_STATES(before as i32)));
+                [base, overlay]
+            });
+            #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| {
                     if composed {
@@ -6695,6 +6723,14 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
+            }
+            #[cfg(feature = "diagnostics")]
+            if let Some(sampled) = sampled_planes {
+                for (name, sample) in ["base", "overlay"].into_iter().zip(sampled) {
+                    if let Some(sample) = sample {
+                        crate::capture::plane_samples(frame, name, &sample);
+                    }
+                }
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);

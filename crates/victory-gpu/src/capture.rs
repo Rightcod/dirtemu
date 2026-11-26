@@ -356,6 +356,63 @@ pub(crate) fn save_read_back(
     }
 }
 
+pub(crate) fn plane_samples(
+    frame: u64,
+    plane: &str,
+    read: &(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT),
+) {
+    let (buffer, footprint) = read;
+    let f = footprint.Footprint;
+    if !matches!(f.Format.0, 27..=29 | 87 | 90 | 91) {
+        tracing::info!(
+            frame,
+            plane,
+            format = f.Format.0,
+            "display plane sample format unsupported"
+        );
+        return;
+    }
+    let mut data = std::ptr::null_mut();
+    let mut samples = [0u64; 4];
+    let mut max_rgb = 0;
+    let mut alpha = (u8::MAX, 0u8);
+    // SAFETY: the copy finished and the footprint describes the mapped rows.
+    unsafe {
+        if buffer.Map(0, None, Some(&mut data)).is_err() {
+            return;
+        }
+        for y in (0..f.Height as usize).step_by(8) {
+            for x in (0..f.Width as usize).step_by(8) {
+                let pixel = data
+                    .cast::<u8>()
+                    .add(footprint.Offset as usize + y * f.RowPitch as usize + x * 4);
+                let rgb = (*pixel).max(*pixel.add(1)).max(*pixel.add(2));
+                let a = *pixel.add(3);
+                max_rgb = max_rgb.max(rgb);
+                alpha = (alpha.0.min(a), alpha.1.max(a));
+                samples[0] += 1;
+                samples[1] += u64::from(rgb > 4);
+                samples[2] += u64::from(a == 0);
+                samples[3] += u64::from(a == 255);
+            }
+        }
+        buffer.Unmap(0, None);
+    }
+    tracing::info!(
+        frame,
+        plane,
+        width = f.Width,
+        height = f.Height,
+        total = samples[0],
+        lit = samples[1],
+        transparent = samples[2],
+        opaque = samples[3],
+        max_rgb,
+        ?alpha,
+        "display plane sampled"
+    );
+}
+
 /// With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in
 /// `VICTORY_CAPTURE_FRAMES` render to or write, in first-use order, saved
 /// at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`

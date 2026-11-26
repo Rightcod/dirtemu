@@ -181,14 +181,11 @@ impl Shader {
 
 #[cfg(windows)]
 fn translate(container: &[u8], mesh_fallback: bool) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
+    use victory_shader::{Container, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL) {
-        Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
-        None => Vec::new(),
-    };
+    let programs = victory_shader::container_programs(&c).map_err(|e| e.to_string())?;
     let host = crate::shader_cache::host_shader(container, mesh_fallback)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let used = programs
@@ -516,7 +513,10 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = {
+        let pending = make::Pending::new(shaders.clone(), graphics);
+        recipe::take(pending.key()).unwrap_or_else(|| Arc::new(pending))
+    };
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
@@ -708,6 +708,25 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod recipe;
+
+#[cfg(windows)]
+pub use recipe::Report as PipelinePrecompileReport;
+
+#[cfg(windows)]
+pub fn record_pipeline_recipes(dir: std::path::PathBuf) -> std::io::Result<()> {
+    recipe::configure(dir)
+}
+
+#[cfg(windows)]
+pub fn precompile_pipelines(jobs: usize) -> anyhow::Result<PipelinePrecompileReport> {
+    anyhow::ensure!(
+        crate::host::host().is_some(),
+        "no D3D12 device for precompilation"
+    );
+    recipe::precompile(jobs.clamp(1, 16))
+}
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
@@ -734,6 +753,7 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
+    recipe::flush();
 }
 
 #[cfg(test)]

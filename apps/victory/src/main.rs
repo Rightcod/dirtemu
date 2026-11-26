@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+#[cfg(windows)]
+mod precompile;
 mod run;
 mod shader;
 mod translate;
@@ -85,6 +87,17 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Translate package shaders and build recorded pipelines without starting the title.
+    Precompile {
+        exe: PathBuf,
+        #[arg(long, value_enum, default_value_t = Console::SeriesX)]
+        console: Console,
+        /// Shader input to scan. Repeat to override package discovery.
+        #[arg(long)]
+        shader: Vec<PathBuf>,
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -97,6 +110,12 @@ enum Command {
         /// Actually start the title. Without it, stop after binding.
         #[arg(long)]
         execute: bool,
+        /// Finish the shader and pipeline precompilation before starting the title.
+        #[arg(long, requires = "execute", conflicts_with = "record_pipelines")]
+        precompile: bool,
+        /// Save pipeline state when first used, for the next precompilation.
+        #[arg(long, requires = "execute")]
+        record_pipelines: bool,
         /// The console model the title sees (device type, memory).
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
@@ -119,6 +138,17 @@ enum Unimplemented {
 enum Console {
     SeriesX,
     SeriesS,
+}
+
+#[cfg(windows)]
+impl Console {
+    fn select(self) {
+        use victory_hle::console;
+        console::set(match self {
+            Self::SeriesX => console::Console::SeriesX,
+            Self::SeriesS => console::Console::SeriesS,
+        });
+    }
 }
 
 fn main() -> Result<()> {
@@ -154,11 +184,17 @@ fn main() -> Result<()> {
             jobs,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
-            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
                 victory_shader::emit::set_view_heap_limit(n);
             }
             // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
-            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+            if let Some(n) = std::env::var("VICTORY_HOST_WAVE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
                 victory_shader::emit::set_host_max_wave(n);
             }
             translate::run(paths, validate, pipelines, list, jobs)
@@ -168,9 +204,42 @@ fn main() -> Result<()> {
             unimplemented,
             strict,
             execute,
+            precompile,
+            record_pipelines,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => run::run(
+            &exe,
+            unimplemented,
+            strict,
+            execute,
+            console,
+            precompile,
+            record_pipelines,
+        ),
+        Command::Precompile {
+            exe,
+            console,
+            shader,
+            jobs,
+        } => {
+            #[cfg(windows)]
+            {
+                let cfg = victory_core::Config::load()?;
+                let bytes = std::fs::read(&exe)?;
+                let hash = blake3::hash(&bytes).to_hex();
+                drop(bytes);
+                console.select();
+                victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+                precompile::record(&cfg, hash.as_str(), console)?;
+                precompile::prepare(&cfg, &exe, hash.as_str(), console, Some(&shader), jobs)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (exe, console, shader, jobs);
+                anyhow::bail!("shader and pipeline precompilation requires Windows")
+            }
+        }
         Command::Config => show_config(),
     }
 }

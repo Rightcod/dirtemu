@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
-use crate::descriptor::View;
+use crate::descriptor::{RtvRecord, View};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -168,11 +168,11 @@ pub(crate) struct State {
     topology: u32,
     /// What the title set that goes straight onto the host list, kept for
     /// the host list that continues this one after a cut ([`State::replay`]):
-    /// whether a topology was set, the render target and depth handles, the
+    /// whether a topology was set, the render target and depth views, the
     /// viewports, the scissors, the blend factor and the stencil reference.
     topology_set: bool,
-    target_handles: Vec<u64>,
-    depth_handle: u64,
+    target_views: Vec<RtvRecord>,
+    depth_view: Option<RtvRecord>,
     targets_set: bool,
     host_targets: Option<bool>,
     viewports: Vec<D3D12_VIEWPORT>,
@@ -510,10 +510,22 @@ impl State {
     }
 
     pub(crate) fn set_targets(&mut self, _list: &HostList, handles: &[u64], depth: u64) {
-        self.target_handles.clear();
-        self.target_handles.extend_from_slice(handles);
-        self.depth_handle = depth;
+        self.target_views.clear();
+        for &handle in handles {
+            match crate::descriptor::rtv_record(handle) {
+                Some(record) => self.target_views.push(record),
+                None => once!(
+                    handle = format_args!("{handle:#x}"),
+                    "render target without a recorded view"
+                ),
+            }
+        }
+        self.depth_view = crate::descriptor::dsv_record(depth);
         self.targets_set = true;
+        self.invalidate_targets();
+    }
+
+    fn invalidate_targets(&mut self) {
         self.host_targets = None;
         self.targets.clear();
         self.depth = 0;
@@ -528,14 +540,7 @@ impl State {
         };
         self.targets.clear();
         let mut rtvs = Vec::new();
-        for &h in &self.target_handles {
-            let Some(record) = crate::descriptor::rtv_record(h) else {
-                once!(
-                    handle = format_args!("{h:#x}"),
-                    "render target without a recorded view"
-                );
-                continue;
-            };
+        for record in &self.target_views {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 // A typed null view (or a target without a host copy) still
                 // takes its slot: left out, the next live target would move
@@ -559,7 +564,7 @@ impl State {
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
         let dsv = depth_stencil
-            .then(|| crate::descriptor::dsv_record(self.depth_handle))
+            .then_some(self.depth_view)
             .flatten()
             .and_then(|record| {
                 let texture = crate::resource::host_resource(record.resource)?;
@@ -630,20 +635,13 @@ impl State {
     /// draw anyway. The dynamic descriptor slots and the tables made in
     /// them stay: the parts before the cut have not run yet, and they are
     /// given back when the title's list is reset.
-    /// shortcut: the render target views are made again from the handles'
-    /// descriptors as they are now, not as they were when the title set
-    /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
-        self.host_targets = None;
+        self.invalidate_targets();
         if self.topology_set {
             self.set_topology(list, self.topology);
-        }
-        if self.targets_set {
-            let handles = std::mem::take(&mut self.target_handles);
-            self.set_targets(list, &handles, self.depth_handle);
         }
         if !self.viewports.is_empty() {
             crate::draw::viewports(list, &self.viewports);
@@ -3024,6 +3022,7 @@ mod tests {
         let large = TestTexture::new(1920, 1080, 28, 1);
         let small = TestTexture::new(1280, 720, 28, 1);
         let depth = TestTexture::new(1280, 720, 40, 2);
+        let replacement_depth = TestTexture::new(1280, 720, 40, 2);
         let mut large_view = [0u64; 14];
         let mut small_view = [0u64; 14];
         let mut depth_view = [0u64; 14];
@@ -3036,9 +3035,11 @@ mod tests {
         let list = host.new_list().expect("host list");
         let mut state = State::default();
         state.set_targets(&list, &[large_handle], depth_handle);
+        crate::descriptor::create_rtv(std::ptr::null(), small.0, std::ptr::null(), large_handle);
         assert_eq!(state.host_targets, None);
         assert_eq!(state.depth, 0);
         state.bind_targets(&list, false);
+        assert_eq!(state.targets, [large.0 as usize]);
         assert_eq!(state.host_targets, Some(false));
         assert_eq!(state.depth, 0);
         unsafe { host.device.GetDeviceRemovedReason() }.expect("unused mismatched DSV was bound");
@@ -3054,10 +3055,18 @@ mod tests {
         assert_eq!(state.depth, depth.0 as usize);
 
         let continued = host.new_list().expect("continued list");
+        crate::descriptor::create_rtv(std::ptr::null(), large.0, std::ptr::null(), small_handle);
+        crate::descriptor::create_dsv(
+            std::ptr::null(),
+            replacement_depth.0,
+            std::ptr::null(),
+            depth_handle,
+        );
         state.replay(&continued);
         assert_eq!(state.host_targets, None);
         assert_eq!(state.depth, 0);
         state.bind_targets(&continued, true);
+        assert_eq!(state.targets, [small.0 as usize]);
         assert_eq!(state.depth, depth.0 as usize);
         state.set_targets(&continued, &[large_handle], depth_handle);
         state.bind_targets(&continued, false);

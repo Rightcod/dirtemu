@@ -72,6 +72,20 @@ cargo build --profile diag -p victory --features diagnostics
 powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game folder>\<the game's exe>"
 ```
 
+The launcher waits for shader translation and recorded D3D12 pipelines before
+starting the title. The first run scans the package's shader archives and
+DLLs. It records new pipeline states as the title uses them. Later runs
+prepare those exact states before the title starts. Keep the cache directory
+on the same drive across runs. Pipeline recipes are specific to the game
+build and console profile. Shader and driver refusals appear in the summary.
+
+To warm the cache without starting the game, use the same console profile and
+environment as the launcher.
+
+```powershell
+victory precompile "<your game folder>\<the game's exe>" --console series-x
+```
+
 For RX 570 / Polaris experiments:
 
 ```powershell

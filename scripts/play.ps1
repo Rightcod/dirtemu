@@ -1,12 +1,16 @@
 # ztrx launcher: runs the game for normal play (no scripted presses, no capture).
 param(
     [Parameter(Mandatory = $true)][string]$Game,
-    [string]$Cache = "$PSScriptRoot\..\cache",
-    [string]$Data = "$PSScriptRoot\..\data",
+    [string]$Cache = "",
+    [string]$Data = "",
     [string]$Exe = "$PSScriptRoot\..\target\release\victory.exe",
     [string]$Console = "series-s"
 )
 $ScriptAuthor = "carunodev"
+$Repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
+$Runtime = "$Repo-runtime"
+if (-not $Cache) { $Cache = Join-Path $Runtime "cache" }
+if (-not $Data) { $Data = Join-Path $Runtime "data" }
 foreach ($v in "VICTORY_KEYS", "VICTORY_CAPTURE", "VICTORY_CAPTURE_FRAMES", "VICTORY_DUMP_TARGETS", "VICTORY_DISABLE_UPSCALER", "VICTORY_STACKS") {
     Remove-Item "Env:$v" -ErrorAction SilentlyContinue
 }
@@ -31,5 +35,5 @@ $env:TMP = $env:TEMP
 $env:VICTORY_CACHE_DIR = (Resolve-Path -LiteralPath $Cache).Path
 $env:VICTORY_DATA_DIR = (Resolve-Path -LiteralPath $Data).Path
 $LogPath = Join-Path $Cache "ztrx.log"
-& $Exe run $Game --console $Console --execute 2>&1 | Out-File $LogPath -Encoding utf8
+& $Exe run $Game --console $Console --execute --precompile 2>&1 | Tee-Object -FilePath $LogPath
 Write-Host "Exited with $LASTEXITCODE; log: $LogPath"

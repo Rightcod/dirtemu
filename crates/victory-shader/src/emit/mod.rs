@@ -115,6 +115,13 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use lower::set_host_max_wave;
+
+pub fn shader_target_key() -> [u8; 8] {
+    let mut key = [0; 8];
+    key[..4].copy_from_slice(&lower::host_max_wave().to_le_bytes());
+    key[4..].copy_from_slice(&shader::view_heap_limit().to_le_bytes());
+    key
+}
 pub use mesh_fallback::MeshFallback;
 pub use profile::{
     ResolvedShaderProfile, ShaderProfile, ShaderProfileRequest, configure_shader_profile,
@@ -314,10 +321,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 /// are identical in both modes.
 pub fn translate_mesh(container: &[u8], mode: MeshTranslation) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let native = crate::container_programs(&c)?
         .into_iter()
         .find(|p| {
             matches!(
