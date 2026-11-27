@@ -1693,6 +1693,15 @@ mod barycentric_tests {
     }
 
     /// The translation's `SFI0` features and `ISG1` rows.
+    #[test]
+    fn pixel_quad_swizzle_without_discard_validates() {
+        let [out0, out1] = exp_mrt0(2);
+        let words = [0x36 << 26 | 0x35 << 18 | 0x80b1, 2 << 24, out0, out1, 0xBF81_0000];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        assert_ne!(parts(&shader).0 & 0x4000, 0);
+        validate(&shader);
+    }
+
     fn parts(shader: &HostShader) -> (u64, Vec<SigElement>) {
         let c = Container::parse(&shader.dxil).unwrap();
         let sfi0 = c.part(FourCC::SFI0).unwrap().data.try_into().unwrap();

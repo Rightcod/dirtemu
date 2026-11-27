@@ -2561,6 +2561,8 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let windowed = windows()
+            && !args.in_place()
+            && !counter.as_ref().is_some_and(|(copy, _)| copy.in_place())
             && kind != DISPATCH
             && p.mesh_fallback.is_none()
             && max == 1

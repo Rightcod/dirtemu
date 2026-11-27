@@ -1924,6 +1924,10 @@ impl Shadow {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
     }
 
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// Title memory `[start, start + len)` in place: `placed` is a buffer
     /// over it in a heap opened on it. Shaped as a copy so that everything
     /// that binds, views or keeps a copy works on it unchanged; what
@@ -3121,12 +3125,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
         let size = len.next_multiple_of(1 << 16);
+        if let Some(placed) = crate::port::place_for(key.0, len, false) {
+            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            return entry.shadow.clone();
+        }
         // The profile's cap on host copies, checked under one lock with the
         // allocation so two copies cannot both pass it.
-        let _budget = COPY_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
-        if !admit_host_copy(size) {
-            return None;
-        }
         // In place, if asked for and the memory can be opened
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
@@ -3135,6 +3139,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
+        }
+        let _budget = COPY_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+        if !admit_host_copy(size) {
+            return None;
         }
         let (buffer, data) = host()?.shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
@@ -3376,7 +3384,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
-    if let Some(placed) = crate::inplace::place_for(start, len, true) {
+    if let Some(placed) = crate::port::place_for(start, len, true)
+        .or_else(|| crate::inplace::place_for(start, len, true)) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());

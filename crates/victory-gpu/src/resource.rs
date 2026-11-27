@@ -2938,6 +2938,52 @@ mod tests {
     /// then read back from the host GPU.
     #[cfg(windows)]
     #[test]
+    fn streamed_texture_changes_after_recording_reach_the_same_submission() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else { return };
+        let null = std::ptr::null();
+        let mut image = null;
+        assert_eq!(create_committed(null, &PROPERTIES, 0, &texture(4, 4, 28, 1),
+            0, null.cast(), &RESOURCE_IIDS[0], &mut image), S_OK);
+        let (memory, desc) = texture_memory(image).unwrap();
+        let bytes = texture_layout(&desc).unwrap().size as usize;
+        let target = host_resource(image).unwrap();
+        let mut footprints = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default()];
+        let mut total = 0;
+        unsafe { host.device.GetCopyableFootprints(&target.GetDesc(), 0, 1, 0,
+            Some(footprints.as_mut_ptr()), None, None, Some(&mut total)); }
+        let (back, data) = host.shared_buffer(total).unwrap();
+        for value in [0x31u8, 0xa7, 0x5c] {
+            let list = host.new_list().unwrap();
+            crate::texture::upload(&list, image, target);
+            crate::list::ensure_state(&list, image, 0x800);
+            let destination = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: unsafe { std::mem::transmute_copy(&back) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprints[0] },
+            };
+            let source = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: unsafe { std::mem::transmute_copy(target) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            unsafe { list.list.CopyTextureRegion(&destination, 0, 0, 0, &source, None); }
+            list.close();
+            crate::watch::writing(memory as usize, bytes);
+            unsafe { std::ptr::write_bytes(memory as *mut u8, value, bytes); }
+            crate::watch::wrote(memory as usize, bytes);
+            host.execute(&[&list]);
+            let read = unsafe { std::slice::from_raw_parts(data, total as usize) };
+            for row in 0..4 {
+                let start = row * footprints[0].Footprint.RowPitch as usize;
+                assert_eq!(&read[start..start + 16], &[value; 16]);
+            }
+        }
+        slot::<Release>(image, 0x10)(image);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn buffer_data_reaches_the_host_texture() {
         use windows::Win32::Graphics::Direct3D12::*;
         let Some(host) = crate::host::host() else {

@@ -35,6 +35,8 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod port;
 pub mod list;
 #[cfg(windows)]
 mod memory;

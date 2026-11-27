@@ -25,7 +25,10 @@ foreach ($pair in @(
     @("VICTORY_CARD_BUFFERS_MIN_MB", "8"),
     @("VICTORY_CARD_BUFFERS_MB", "768"),
     @("VICTORY_CARD_WINDOWS_MB", "128"),
-    @("VICTORY_CARD_REHASH_RUNS", "1")
+    @("VICTORY_CARD_REHASH_RUNS", "1"),
+    @("VICTORY_TEXTURE_MB", "1536"),
+    @("VICTORY_WINDOW_TAILS", "1"),
+    @("VICTORY_PORT_CONSTANTS", "1")
 )) {
     if (-not (Test-Path "Env:$($pair[0])")) {
         Set-Item "Env:$($pair[0])" $pair[1]

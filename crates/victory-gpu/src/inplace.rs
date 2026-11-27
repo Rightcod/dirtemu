@@ -200,6 +200,12 @@ pub(crate) fn gone(window: bool, bytes: u64) {
     STATS[at + 1].fetch_sub(bytes, Ordering::Relaxed);
 }
 
+pub(crate) fn counted(window: bool, bytes: u64) {
+    let at = if window { 0 } else { 2 };
+    STATS[at].fetch_add(1, Ordering::Relaxed);
+    STATS[at + 1].fetch_add(bytes, Ordering::Relaxed);
+}
+
 /// Title memory `[at, at + len)` is about to show something else, or the
 /// title is about to decommit, free or protect it: what is in place there
 /// is let go (the tables forget it; its heap goes when the last list and
@@ -207,6 +213,7 @@ pub(crate) fn gone(window: bool, bytes: u64) {
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
+    crate::port::forget(at, len);
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -417,6 +424,51 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.
 pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&views().views, at, len)
+}
+
+pub(crate) fn stretch(at: usize, len: usize) -> Option<(usize, usize, usize, u64)> {
+    stretch_in(&views().views, at, len)
+}
+
+fn stretch_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
+    -> Option<(usize, usize, usize, u64)>
+{
+    let Cover::Run(section, offset) = cover_in(views, at, len) else { return None };
+    let delta = at as i128 - offset as i128;
+    let follows = |address: usize, s: usize, o: u64|
+        s == section && address as i128 - o as i128 == delta;
+    let (&first, &(bytes, _, _)) = views.range(..=at).next_back()?;
+    let mut start = first;
+    for (&address, &(bytes, s, o)) in views.range(..first).rev() {
+        if address.checked_add(bytes)? != start || !follows(address, s, o) { break; }
+        start = address;
+    }
+    let mut end = first.checked_add(bytes)?;
+    for (&address, &(bytes, s, o)) in views.range(first + 1..) {
+        if address != end || !follows(address, s, o) { break; }
+        end = address.checked_add(bytes)?;
+    }
+    Some((start, end - start, section, (start as i128 - delta) as u64))
+}
+
+#[cfg(test)]
+mod stretch_tests {
+    use super::*;
+
+    #[test]
+    fn stretch_stops_at_holes_and_different_physical_runs() {
+        let views = BTreeMap::from([
+            (0x10000, (0x10000, 7, 0)),
+            (0x20000, (0x10000, 7, 0x10000)),
+            (0x30000, (0x10000, 7, 0x20000)),
+            (0x40000, (0x10000, 7, 0x90000)),
+            (0x60000, (0x10000, 7, 0xa0000)),
+        ]);
+        assert_eq!(stretch_in(&views, 0x21000, 0x12000), Some((0x10000, 0x30000, 7, 0)));
+        assert_eq!(stretch_in(&views, 0x41000, 0x100), Some((0x40000, 0x10000, 7, 0x90000)));
+        assert_eq!(stretch_in(&views, 0x31000, 0x11000), None);
+        assert_eq!(stretch_in(&views, 0x41000, 0x21000), None);
+    }
 }
 
 /// Whether `[at, at + len)` is private memory, all committed and
@@ -1394,6 +1446,59 @@ mod tests {
             mem::VirtualProtect(base.cast(), K64, mem::PAGE_READONLY, &mut old);
             assert!(!private_whole(base as usize, 2 * K64), "a guarded page");
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn warp_constants_section_reads_and_writes_across_title_views() {
+        let Some(device) = warp() else { return };
+        if device.cast::<ID3D12Device13>().is_err() { return; }
+        unsafe {
+            let process = windows_sys::Win32::System::Threading::GetCurrentProcess();
+            let section = mem::CreateFileMappingW(
+                windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE, std::ptr::null(),
+                mem::PAGE_READWRITE | mem::SEC_RESERVE, 0, 8 * K64 as u32, std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let hole = mem::VirtualAlloc2(process, std::ptr::null(), 8 * K64,
+                mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER, mem::PAGE_NOACCESS,
+                std::ptr::null_mut(), 0).cast::<u8>();
+            assert!(!hole.is_null());
+            assert_ne!(mem::VirtualFree(hole.cast(), 3 * K64,
+                mem::MEM_RELEASE | mem::MEM_PRESERVE_PLACEHOLDER), 0);
+            let mut mapped = Vec::new();
+            for (page, count) in [(0usize, 3usize), (3, 5)] {
+                let view = mem::MapViewOfFile3(section, process, hole.add(page * K64).cast(),
+                    (page * K64) as u64, count * K64, mem::MEM_REPLACE_PLACEHOLDER,
+                    mem::PAGE_READWRITE, std::ptr::null_mut(), 0);
+                assert!(!view.Value.is_null());
+                assert!(!mem::VirtualAlloc(view.Value, count * K64,
+                    mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
+                title_memory_view(view.Value as usize, count * K64, section as usize,
+                    (page * K64) as u64);
+                mapped.push(view);
+            }
+            let start = hole as u64 + K64 as u64 + 64;
+            let len = 5 * K64;
+            let placed = crate::port::place_in(&device, start, len as u64).unwrap();
+            let mut rig = Rig::new(&device).unwrap();
+            for (i, byte) in std::slice::from_raw_parts_mut(start as *mut u8, len).iter_mut().enumerate() {
+                *byte = (i * 7 + 3) as u8;
+            }
+            assert_eq!(rig.fetch(&placed.buffer, placed.bias, len).unwrap(),
+                std::slice::from_raw_parts(start as *const u8, len));
+            rig.store(&placed.buffer, placed.bias + 3 * K64 as u64, &[0x5a; 256]).unwrap();
+            assert!(std::slice::from_raw_parts((start + 3 * K64 as u64) as *const u8, 256)
+                .iter().all(|&byte| byte == 0x5a));
+            drop(placed);
+            crate::port::forget(hole as usize, 8 * K64);
+            for view in mapped {
+                assert_ne!(mem::UnmapViewOfFile2(process, view, mem::MEM_PRESERVE_PLACEHOLDER), 0);
+            }
+            views_gone(hole as usize, 8 * K64);
+            mem::VirtualFree(hole.cast(), 0, mem::MEM_RELEASE);
+            mem::VirtualFree(hole.add(3 * K64).cast(), 0, mem::MEM_RELEASE);
+            windows_sys::Win32::Foundation::CloseHandle(section);
         }
     }
 

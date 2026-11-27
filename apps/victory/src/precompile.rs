@@ -135,6 +135,7 @@ mod windows {
         let processed = AtomicUsize::new(0);
         let ready = AtomicUsize::new(0);
         let refused = AtomicUsize::new(0);
+        let failures = Mutex::new(Vec::new());
         std::thread::scope(|scope| {
             for _ in 0..jobs.min(total) {
                 scope.spawn(|| {
@@ -150,6 +151,8 @@ mod windows {
                                     Ok(()) => { ready.fetch_add(1, Ordering::Relaxed); }
                                     Err(error) => {
                                         refused.fetch_add(1, Ordering::Relaxed);
+                                        failures.lock().unwrap_or_else(|e| e.into_inner())
+                                            .push(format!("{hash}\t{error}"));
                                         tracing::debug!(%error, %hash, "shader precompilation refused");
                                     }
                                 }
@@ -172,6 +175,9 @@ mod windows {
             total
         );
         println!("shader cache      {}  {result}", path.display());
+        let mut failures = failures.into_inner().unwrap_or_else(|e| e.into_inner());
+        failures.sort_unstable();
+        std::fs::write(marker.with_extension("failures.txt"), failures.join("\n"))?;
         if modified.is_some() {
             let temporary = marker.with_extension(format!("{}.tmp", std::process::id()));
             std::fs::write(&temporary, &result)?;

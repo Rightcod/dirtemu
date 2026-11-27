@@ -68,7 +68,20 @@ pub fn limits() -> &'static Limits {
     LIMITS.get_or_init(|| {
         let facts = device_facts();
         let resolved = victory_core::memory::resolve(victory_core::memory::request(), facts);
-        let limits = Limits::for_profile(resolved.profile, facts);
+        let mut limits = Limits::for_profile(resolved.profile, facts);
+        if let Some(bytes) = std::env::var("VICTORY_TEXTURE_MB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .and_then(|mb| mb.checked_mul(1 << 20))
+            .filter(|&bytes| bytes > 0)
+        {
+            let maximum = if facts.dedicated_video_memory > 0 {
+                facts.dedicated_video_memory / 4
+            } else {
+                512 << 20
+            };
+            limits.texture_bytes = bytes.min(maximum).max(1);
+        }
         tracing::info!(
             profile = limits.profile.as_str(),
             why = resolved.why.as_str(),

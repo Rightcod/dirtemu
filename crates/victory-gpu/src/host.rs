@@ -1778,7 +1778,7 @@ enum Step {
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>),
+    Texture(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2292,7 +2292,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging, _) => {
                     let (at, len) = staging.memory();
                     if touches(written, at, at + len) {
                         if count {
@@ -5223,6 +5223,23 @@ impl HostList {
         let mut to_copy = Vec::new();
         let mut barriers = Vec::new();
         let mut copying = std::collections::HashMap::new();
+        let deferred = self.deferred();
+        let uploads: Vec<_> = deferred.copies.iter().filter_map(|step| {
+            if let Step::Texture(staging, copy) = step {
+                staging.claim_upload().then_some((staging, copy))
+            } else { None }
+        }).collect();
+        for (_, texture) in &uploads {
+            let key = std::sync::Arc::as_ptr(texture) as usize;
+            let real = texture.state.load(Ordering::Relaxed);
+            copying.insert(key, COPY_DEST);
+            if real != COPY_DEST {
+                to_copy.push(transition(&texture.texture, host_state(real), host_state(COPY_DEST)));
+            }
+            if !states.contains_key(&key) && real != COPY_DEST {
+                barriers.push(transition(&texture.texture, host_state(COPY_DEST), host_state(real)));
+            }
+        }
         for (depth, twin, colour) in &syncs {
             let (from, to) = if *colour {
                 (depth, &twin.colour)
@@ -5255,7 +5272,7 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -5275,6 +5292,9 @@ impl HostList {
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
+                }
+                for (staging, copy) in &uploads {
+                    staging.record_upload(list, &copy.texture);
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -5599,8 +5619,8 @@ impl HostList {
 
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
-        self.deferred().copies.push(Step::Texture(staging));
+    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>, copy: std::sync::Arc<crate::resource::HostTexture>) {
+        self.deferred().copies.push(Step::Texture(staging, copy));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -5676,7 +5696,7 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging, _) => {
                     if batch.texture_due(staging) {
                         staging.refresh();
                     }

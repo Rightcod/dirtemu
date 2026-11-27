@@ -20,6 +20,90 @@ use windows::core::PCSTR;
 use super::{Shader, Translated};
 use crate::host::host;
 
+fn integer_target(format: DXGI_FORMAT) -> bool {
+    matches!(
+        format,
+        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT | DXGI_FORMAT_R8_SINT
+    )
+}
+
+fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D12_BLEND_DESC {
+    let count = (targets.NumRenderTargets as usize).min(8);
+    let independent = blend.IndependentBlendEnable.as_bool();
+    if !(0..count).any(|i| {
+        integer_target(targets.RTFormats[i])
+            && blend.RenderTarget[if independent { i } else { 0 }].BlendEnable.as_bool()
+    }) {
+        return *blend;
+    }
+    let mut result = *blend;
+    if !independent {
+        result.IndependentBlendEnable = true.into();
+        result.RenderTarget = [blend.RenderTarget[0]; 8];
+    }
+    for i in 0..count {
+        if integer_target(targets.RTFormats[i]) {
+            result.RenderTarget[i].BlendEnable = false.into();
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod integer_blend_tests {
+    use super::*;
+
+    #[test]
+    fn shared_blend_is_expanded_without_changing_color_targets() {
+        let mut blend = GraphicsState::default().blend;
+        blend.RenderTarget[0].BlendEnable = true.into();
+        blend.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        blend.RenderTarget[0].RenderTargetWriteMask = 3;
+        let mut targets = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 3, ..Default::default() };
+        targets.RTFormats[..3].copy_from_slice(&[
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R16G16B16A16_FLOAT,
+        ]);
+        let result = host_blend(&blend, &targets);
+        assert!(result.IndependentBlendEnable.as_bool());
+        assert_eq!(result.RenderTarget[0], blend.RenderTarget[0]);
+        assert_eq!(result.RenderTarget[2], blend.RenderTarget[0]);
+        assert!(!result.RenderTarget[1].BlendEnable.as_bool());
+        assert_eq!(result.RenderTarget[1].SrcBlend, D3D12_BLEND_SRC_ALPHA);
+        assert_eq!(result.RenderTarget[1].RenderTargetWriteMask, 3);
+        assert!(blend.RenderTarget[0].BlendEnable.as_bool());
+    }
+
+    #[test]
+    fn independent_and_unused_targets_keep_their_state() {
+        let mut blend = GraphicsState::default().blend;
+        blend.IndependentBlendEnable = true.into();
+        blend.RenderTarget[0].BlendEnable = true.into();
+        blend.RenderTarget[1].BlendEnable = true.into();
+        blend.RenderTarget[1].RenderTargetWriteMask = 1;
+        let mut targets = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 2, ..Default::default() };
+        targets.RTFormats[..3].copy_from_slice(&[
+            DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R8_UINT,
+        ]);
+        let result = host_blend(&blend, &targets);
+        assert_eq!(result.RenderTarget[0], blend.RenderTarget[0]);
+        assert!(!result.RenderTarget[1].BlendEnable.as_bool());
+        assert_eq!(result.RenderTarget[1].RenderTargetWriteMask, 1);
+        assert_eq!(result.RenderTarget[2], blend.RenderTarget[2]);
+        targets.NumRenderTargets = 1;
+        assert_eq!(host_blend(&blend, &targets), blend);
+    }
+}
+
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
 pub(crate) struct GraphicsState {
@@ -802,7 +886,7 @@ impl HostPipeline {
                 pRootSignature: unsafe { std::mem::transmute_copy(&root) },
                 VS: vs,
                 PS: code(1),
-                BlendState: g.blend,
+                BlendState: host_blend(&g.blend, &g.targets),
                 SampleMask: g.sample_mask,
                 RasterizerState: g.rasterizer,
                 DepthStencilState: g.depth,
@@ -926,7 +1010,7 @@ impl HostPipeline {
                         BytecodeLength: gs.len(),
                     }
                 }),
-            BlendState: g.blend,
+            BlendState: host_blend(&g.blend, &g.targets),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -1097,7 +1181,7 @@ fn mesh_pipeline(
         ),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, host_blend(&g.blend, &g.targets)),
         mask: Sub(
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
             g.sample_mask,
