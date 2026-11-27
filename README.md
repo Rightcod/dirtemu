@@ -143,9 +143,11 @@ To warm the cache without starting the game, use the same console profile and
 environment as the launcher.
 
 ```powershell
-.\target\release\victory.exe precompile "<your game folder>\<the game's exe>" --console series-s --jobs 3
+.\target\release\victory.exe precompile "<your game folder>\<the game's exe>" --console series-s --jobs 8
 ```
 
+`--jobs` controls compilation threads. Without it, preparation uses every
+logical CPU core, up to 16 threads; pass `--jobs 3` to reduce CPU and memory use.
 Add `--used-only` to build only states used in previous runs.
 For a bounded preparation, set `$env:VICTORY_PRECOMPILE_TOTAL = "20000"`
 before running `precompile`. It selects at most the first 20,000 recipes,
@@ -167,9 +169,17 @@ library. Later runs skip those completed recipes; changing translator settings
 or losing the compatible driver library invalidates the relevant progress.
 Preparation runs in workers of at most 2,048 new states, so their temporary
 memory is released between batches. Interrupted preparation resumes from the
-last saved checkpoint. Refused states are counted separately and retried when
+last saved checkpoint. Within preparation workers, new driver pipelines are
+kept until the next checkpoint and then stored together. This prevents
+`StorePipeline` writes from blocking workers still loading and compiling
+other states. The journal advances only after pending stores and the library
+have been saved. Set `VICTORY_PRECOMPILE_DEFER_STORES=0` to use immediate stores.
+Game rendering keeps immediate stores.
+Refused states are counted separately and retried when
 the preparation identity changes. Previously used pipeline objects are loaded
 into the game process before execution.
+Measurements and the unresolved compiler fault are recorded in
+[the RX 570 preparation report](docs/rx570-precompile-2026-11-27.md).
 The pipeline recording and source fingerprint follow the approach in
 [carlm125/cool_fox](https://github.com/carlm125/cool_fox).
 

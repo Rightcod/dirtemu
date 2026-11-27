@@ -21,11 +21,9 @@ mod windows {
         retain_used: bool,
     ) -> Result<()> {
         let jobs = jobs
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map_or(2, |cores| (cores.get() / 2).clamp(1, 3))
-            })
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, usize::from))
             .clamp(1, 16);
+        tracing::info!(jobs, "shader and pipeline preparation threads");
         let tag = victory_gpu::shader_cache::precompile_setup().map_err(anyhow::Error::msg)?;
         let worker = std::env::var("VICTORY_PRECOMPILE_WORKER").is_ok_and(|value| value == "1");
         if !worker {

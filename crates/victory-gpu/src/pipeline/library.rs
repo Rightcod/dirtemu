@@ -47,10 +47,10 @@
 //! 16,352 of 16,384 pages read zeros with the handle closed, none with it
 //! open (the test below). `VICTORY_LIBRARY_HANDLE=0`: closed, as before.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -562,6 +562,48 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+static PENDING_STORES: LazyLock<Mutex<HashMap<String, ID3D12PipelineState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn deferred_stores() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_PRECOMPILE_WORKER").is_some_and(|value| value == "1")
+            && std::env::var_os("VICTORY_PRECOMPILE_DEFER_STORES").is_none_or(|value| value != "0")
+    })
+}
+
+fn flush_pending(library: &Library) -> bool {
+    let pending = std::mem::take(&mut *PENDING_STORES.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut failed = HashMap::new();
+    for (name, pipeline) in pending {
+        let wide = HSTRING::from(name.as_str());
+        let _call = call("store", &name);
+        match unsafe {
+            library
+                .library
+                .StorePipeline(PCWSTR(wide.as_ptr()), &pipeline)
+        } {
+            Ok(()) => {
+                library.added.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(error) => {
+                tracing::warn!(%error, %name, "deferred host pipeline was not stored");
+                failed.insert(name, pipeline);
+            }
+        }
+    }
+    if failed.is_empty() {
+        true
+    } else {
+        PENDING_STORES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(failed);
+        false
+    }
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
@@ -574,6 +616,14 @@ pub(crate) fn pipeline(
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
+    if deferred_stores()
+        && let Some(pipeline) = PENDING_STORES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+    {
+        return Ok(pipeline.clone());
+    }
     let began = std::time::Instant::now();
     let loaded = {
         let _all = one_call();
@@ -613,6 +663,13 @@ pub(crate) fn pipeline(
     });
     let _all = one_call();
     let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+    if deferred_stores() {
+        PENDING_STORES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_owned(), pso.clone());
+        return Ok(pso);
+    }
     let _call = call("store", name);
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
@@ -658,6 +715,9 @@ pub(crate) fn save_checked(now: bool) -> bool {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
+        if !flush_pending(library) {
+            return false;
+        }
         let added = library.added.load(Ordering::Relaxed);
         let first_save = library._blob.bytes().is_empty() && SAVED.load(Ordering::Relaxed) == 0;
         if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 && !first_save {
