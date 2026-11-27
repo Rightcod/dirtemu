@@ -259,6 +259,17 @@ struct BvhBudget {
     phis: HashMap<usize, V>,
 }
 
+/// How function exits terminate in DXIL: a single exit returns directly, while
+/// multiple exits (`LaneExit::End` / `abort_block`) share one returning block so
+/// `dxil-spirv` under Proton does not see loops exited by both a branch and a
+/// return.
+#[derive(Clone, Copy)]
+enum ReturnSink {
+    None,
+    Single(usize),
+    Shared(usize),
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -378,6 +389,9 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Tracks function return blocks so multi-exit shaders converge on one
+    /// `Term::Ret` block while single-exit DXIL stays unchanged.
+    ret: ReturnSink,
     bvh_profile: super::ray::RayProfile,
     bvh_budget: Option<BvhBudget>,
     #[cfg(test)]
@@ -1777,6 +1791,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            ret: ReturnSink::None,
             bvh_profile,
             bvh_budget,
             #[cfg(test)]
@@ -11130,7 +11145,7 @@ impl<'a> Lower<'a> {
                     self.s
                         .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
                 }
-                Term::Ret
+                self.ret_terminator(self.cur)
             }
             LaneExit::Indirect => return Err(unsupported(offset, "an indirect jump")),
         };
@@ -11197,9 +11212,28 @@ impl<'a> Lower<'a> {
             self.s
                 .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
         }
-        self.s.m.terminate(a, Term::Ret);
+        let term = self.ret_terminator(a);
+        self.s.m.terminate(a, term);
         self.abort = Some(a);
         a
+    }
+
+    /// Terminator for a returning block `from` (see [`ReturnSink`]).
+    fn ret_terminator(&mut self, from: usize) -> Term {
+        match self.ret {
+            ReturnSink::None => {
+                self.ret = ReturnSink::Single(from);
+                Term::Ret
+            }
+            ReturnSink::Single(prev) => {
+                let r = self.s.m.new_block();
+                self.s.m.terminate(r, Term::Ret);
+                self.s.m.terminate(prev, Term::Br(r));
+                self.ret = ReturnSink::Shared(r);
+                Term::Br(r)
+            }
+            ReturnSink::Shared(r) => Term::Br(r),
+        }
     }
 
     /// The DXIL block a branch from IR block `from` to `to` goes to.
