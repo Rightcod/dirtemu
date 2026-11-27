@@ -34,10 +34,10 @@ struct Key {
     ray_profile: RayProfile,
     descriptor_alias_abi: u32,
     direct_heap_policy: u32,
-    target: [u8; 8],
+    target: [u8; 12],
 }
 
-const KEY_BYTES: usize = 32 + 1 + 1 + 8 + 4 + 4 + 8;
+const KEY_BYTES: usize = 32 + 1 + 1 + 8 + 4 + 4 + 12;
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
@@ -155,7 +155,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn version(&self) -> u32 {
         // Bump with the entry encoding and key layout.
-        5
+        6
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
@@ -181,7 +181,7 @@ fn cached(
             ray_profile: RayProfile::Full,
             descriptor_alias_abi: DESCRIPTOR_ALIAS_ABI,
             direct_heap_policy: DIRECT_HEAP_POLICY,
-            target: [0; 8],
+            target: [0; 12],
         },
         translate,
     )
@@ -571,7 +571,7 @@ mod tests {
             Ok(shader())
         };
         let hardware_65 = Key {
-            target: [0; 8],
+            target: [0; 12],
             mesh_fallback: false,
             profile: Some(ShaderProfile::Sm65),
             ray_profile: RayProfile::Full,
@@ -609,7 +609,7 @@ mod tests {
         let build = [9u8; 32];
         let runs = AtomicU64::new(0);
         let base = Key {
-            target: [0; 8],
+            target: [0; 12],
             mesh_fallback: false,
             profile: Some(ShaderProfile::Sm65),
             ray_profile: RayProfile::Full,
@@ -652,7 +652,7 @@ mod tests {
             Ok(shader())
         };
         let base = Key {
-            target: [0; 8],
+            target: [0; 12],
             mesh_fallback: false,
             profile: Some(ShaderProfile::Sm65),
             ray_profile: RayProfile::Full,
@@ -693,7 +693,7 @@ mod tests {
         let build = [6u8; 32];
         let runs = AtomicU64::new(0);
         let key = |profile| Key {
-            target: [0; 8],
+            target: [0; 12],
             mesh_fallback: false,
             profile: Some(profile),
             ray_profile: RayProfile::Full,

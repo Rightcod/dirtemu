@@ -76,7 +76,7 @@ pub fn rect_list_gs(vs: &[u8], ps: Option<&[u8]>) -> Result<Vec<u8>, ShaderError
 }
 
 /// The shader model a DXIL container declares, when it is one we emit.
-fn profile_of(dxil: &[u8]) -> Option<super::ShaderProfile> {
+pub(super) fn profile_of(dxil: &[u8]) -> Option<super::ShaderProfile> {
     let container = Container::parse(dxil).ok()?;
     let program = crate::DxilProgram::parse(container.part(FourCC::DXIL)?.data).ok()?;
     match program.shader_model {

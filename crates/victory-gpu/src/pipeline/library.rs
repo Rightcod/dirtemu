@@ -624,22 +624,30 @@ pub(crate) fn pipeline(
 
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
+pub(crate) fn warm_cache_loaded() -> bool {
+    library().is_some_and(|library| !library._blob.bytes().is_empty())
+}
+
 pub(crate) fn save(now: bool) {
+    let _ = save_checked(now);
+}
+
+pub(crate) fn save_checked(now: bool) -> bool {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else {
-        return;
+        return false;
     };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-            return;
+            return false;
         }
         *last = Some(std::time::Instant::now());
     }
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
-        return;
+        return false;
     }
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
@@ -651,10 +659,11 @@ pub(crate) fn save(now: bool) {
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
-        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
-            return;
+        let first_save = library._blob.bytes().is_empty() && SAVED.load(Ordering::Relaxed) == 0;
+        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 && !first_save {
+            return true;
         }
-        if added == 0 {
+        if added == 0 && !first_save {
             0
         } else {
             // SAFETY: a plain query.
@@ -663,7 +672,7 @@ pub(crate) fn save(now: bool) {
             if let Err(e) = serialise(&library.library, &tmp, size) {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
                 let _ = std::fs::remove_file(&tmp);
-                return;
+                return false;
             }
             library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
@@ -697,15 +706,22 @@ pub(crate) fn save(now: bool) {
     let written = library_written
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
-        Ok(()) => tracing::info!(
-            bytes,
-            early = used.len(),
-            made = MADE.load(Ordering::Relaxed),
-            loaded = LOADED.load(Ordering::Relaxed),
-            started_early = EARLY.load(Ordering::Relaxed),
-            "host pipeline library saved"
-        ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Ok(()) => {
+            tracing::info!(
+                bytes,
+                early = used.len(),
+                made = MADE.load(Ordering::Relaxed),
+                loaded = LOADED.load(Ordering::Relaxed),
+                started_early = EARLY.load(Ordering::Relaxed),
+                "host pipeline library saved"
+            );
+            true
+        }
+        Err(e) => {
+            library.added.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(error = %e, "host pipeline library not saved");
+            false
+        }
     }
 }
 

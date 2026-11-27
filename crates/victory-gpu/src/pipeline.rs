@@ -727,12 +727,13 @@ pub fn record_pipeline_recipes(dir: std::path::PathBuf) -> std::io::Result<()> {
 pub fn precompile_pipelines(
     jobs: usize,
     used_only: bool,
+    retain_used: bool,
 ) -> anyhow::Result<PipelinePrecompileReport> {
     anyhow::ensure!(
         crate::host::host().is_some(),
         "no D3D12 device for precompilation"
     );
-    recipe::precompile(jobs.clamp(1, 16), used_only)
+    recipe::precompile(jobs.clamp(1, 16), used_only, retain_used)
 }
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline

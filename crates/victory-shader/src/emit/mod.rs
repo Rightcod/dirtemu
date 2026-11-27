@@ -118,10 +118,28 @@ pub use barycentrics::barycentric_gs;
 pub use bitcode::census;
 pub use lower::set_host_max_wave;
 
-pub fn shader_target_key() -> [u8; 8] {
-    let mut key = [0; 8];
+static HOST_SHADER_FEATURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(3);
+
+pub fn set_host_shader_features(barycentrics: bool, typed_atomic64: bool) {
+    HOST_SHADER_FEATURES.store(
+        u32::from(barycentrics) | (u32::from(typed_atomic64) << 1),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn host_shader_features() -> u32 {
+    HOST_SHADER_FEATURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn software_barycentrics(profile: ShaderProfile) -> bool {
+    profile == ShaderProfile::Sm65 || host_shader_features() & 1 == 0
+}
+
+pub fn shader_target_key() -> [u8; 12] {
+    let mut key = [0; 12];
     key[..4].copy_from_slice(&lower::host_max_wave().to_le_bytes());
-    key[4..].copy_from_slice(&shader::view_heap_limit().to_le_bytes());
+    key[4..8].copy_from_slice(&shader::view_heap_limit().to_le_bytes());
+    key[8..].copy_from_slice(&host_shader_features().to_le_bytes());
     key
 }
 pub use mesh_fallback::MeshFallback;

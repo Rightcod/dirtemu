@@ -16,7 +16,8 @@ Target test machine:
 - Windows 10 x64
 - Intel Xeon E3-1240 v3 (4C/8T, AVX2)
 - 16 GiB RAM
-- AMD Radeon RX 570 8 GiB (Polaris, SM 6.5, wave64, no mesh shaders, no DXR)
+- AMD Radeon RX 570 8 GiB (Polaris, wave64, no mesh shaders, no DXR)
+- System DirectX exposes SM 6.5; app-local Agility 1.620.2 exposes SM 6.7
 
 What is already implemented and tested at shader/PSO level:
 
@@ -24,6 +25,7 @@ What is already implemented and tested at shader/PSO level:
 |---|---|
 | SM 6.5 shader translation | implemented; the 22 baseline SM 6.6 GPU failures pass on RX 570 |
 | SM 6.5 descriptor tables | implemented; alias-table PSO/dispatch tests pass on RX 570 |
+| Agility / SM 6.6 | optional app-local runtime; real bindless and typed atomic64 GPU tests pass on RX 570; highest reported model is 6.7 |
 | Mesh shader fallback | compute emulation + vertex pulling + one `DrawInstanced`; 9 279 / 9 282 real mesh shaders translate |
 | Amplification shaders | none found in the inspected shader package |
 | BVH / RT profiles | `Full`, `StaticMiss`, `Limited(N)` implemented and tested on RX 570 |
@@ -31,35 +33,43 @@ What is already implemented and tested at shader/PSO level:
 | Ambient fallback | constant indirect-light fill after ScreenProbes temporal resolve, Polaris default 0.2 |
 | BC3 texture fallback | five unaligned BC3 textures decoded to RGBA8 with original dimensions |
 | Series-S memory profile | title memory, host-copy, texture and staging caps active |
-| Barycentrics / `attributeAtVertex` | SM 6.5 software path through a geometry stage; ordinary triangles, rectangle lists and compute mesh fallback supported |
+| Barycentrics / `attributeAtVertex` | software geometry path when the device lacks barycentrics, including SM 6.6; ordinary triangles, rectangle lists and compute mesh fallback supported |
 | Integer render targets | blending normalized so D3D12 accepts the pipeline |
 | Conservative rasterization | ordinary raster coverage on unsupported devices; conservative edge coverage is not reproduced |
 | Streamed textures | upload decisions follow staging refresh, so new data reaches the same submission; partial uploads retry by elapsed time |
 | Memory pressure | reclaim unused staging buffers; configurable sampled-texture budget; root-window tails reduce duplicate data |
 | Shared constants | optional direct GPU access to the title's constants section, with ordered indirect argument preparation |
-| Precompilation | package shaders and every recorded pipeline state; translator-keyed disk cache preserved across runtime-only rebuilds |
+| Precompilation | package shaders and every recorded pipeline state; persistent progress, bounded workers and translator-keyed disk cache |
 | Full game boot / world / FPS | boot, menus and world image confirmed in earlier runs; new rendering fixes still need an in-game comparison after full precompilation |
 
 Latest validation on the RX 570:
 
-- **53/53 selected problem pipeline states** now create successfully with the
-  D3D12 debug layer, with no refused or unreadable states. Unsupported hardware
+- **53/53 selected problem pipeline states** create successfully at both SM 6.5
+  and Agility SM 6.6 with the D3D12 debug layer, with no refused or unreadable
+  states. The second SM 6.6 preparation reuses all 53 from cache. Unsupported hardware
   barycentrics and conservative rasterization caused their earlier failures.
 - GPU readback tests verify perspective and linear barycentric weights with
   unequal clip-space W, per-vertex attributes, and both halves of rectangle lists.
 - A texture changed after command-list recording reaches the GPU in that same
   submission. Ten GPU regression checks and nine interpolation checks passed.
+- The same installed driver reports SM 6.7 with Agility. A real SM 6.6 bindless
+  compute shader performs 64 conflicting typed atomic64 operations correctly
+  with dynamic texel coordinates; all returned original values match.
 
 Known limitations:
 
-- The previous complete shader-archive pass prepared **24,907 translations**
+- The previous SM 6.5 shader-archive pass prepared **24,907 translations**
   and refused 982 records. Of those refusals, 679 require 64-bit image atomics
-  from SM 6.6 and 195 contain an unsupported shader stage. Precompilation does
-  not supply missing instruction support.
+  from SM 6.6 and 195 contain an unsupported shader stage. Agility removes
+  the runtime's SM 6.5 ceiling; the complete SM 6.6 pass remains to be measured.
+- Driver 31.0.21925.1001 loses conflicting typed atomic updates for literal
+  uniform texture coordinates in a synthetic test, including atomic32.
+  Dynamic coordinates and explicit wave serialization pass. This is a separate
+  correctness issue; an advertised shader model does not establish correctness
+  for every shader. See [the capability investigation](docs/rx570-agility.md).
 - The recorded set contains **83,562 pipeline states**. The first full warm
-  reached 17,792 states before the barycentrics correction; the full pass with
-  the final translator must finish before the next game run. Preparation of
-  every state is not yet a verified result.
+  with the final SM 6.6 translator must finish before the next game run.
+  Preparation of every state is not yet a verified result.
 - 16 GiB RAM is below the practical working set observed in related forks;
   a large pagefile is required and performance will still be limited.
 - Shader translation and driver pipeline refusals still omit rendering passes.
@@ -73,7 +83,7 @@ Known limitations:
 - Windows 10/11 x64, a CPU with AVX2
 - Direct3D 12 GPU
   - hardware path: shader model 6.6 + mesh shaders
-  - RX 570 / Polaris path: shader model 6.5 + compute mesh fallback
+  - RX 570 / Polaris path: shader model 6.5 or 6.6 + compute mesh fallback
 - Rust (the version in `rust-toolchain.toml`)
 - Several GiB of free Windows commit memory; for world loading a large
   pagefile is recommended (32 GiB or more on SSD)
@@ -84,11 +94,27 @@ Known limitations:
 cargo build --release -p victory
 ```
 
+To use the newer DirectX runtime on Windows/MSVC:
+
+```powershell
+cargo build --release -p victory --features agility
+powershell -ExecutionPolicy Bypass -File scripts\setup-agility.ps1
+```
+
+The setup script downloads the official Microsoft Agility 1.620.2 package,
+checks its pinned SHA256 and Microsoft signatures, and places SDK 620 in
+`target\release\D3D12`. It changes no system DLLs or drivers. The `agility`
+build requires those runtime files beside the executable. The default build
+continues to use the system DirectX runtime.
+
 Diagnostics build:
 
 ```powershell
 cargo build --profile diag -p victory --features diagnostics
 ```
+
+For diagnostics with Agility, use `--features diagnostics,agility` and run
+the setup script with `-Destination target\diag`.
 
 ## Play
 
@@ -117,6 +143,14 @@ Failure details are stored in `shader-scan/*.failures.txt` in the configured
 cache. Shader/pipeline preparation is separate from the game's asset streaming.
 Translations are keyed by the translator sources, dependencies, target GPU
 and settings. Rebuilding rendering or runtime code preserves them.
+Completed pipeline preparation is checkpointed after saving the driver
+library. Later runs skip those completed recipes; changing translator settings
+or losing the compatible driver library invalidates the relevant progress.
+Preparation runs in workers of at most 2,048 new states, so their temporary
+memory is released between batches. Interrupted preparation resumes from the
+last saved checkpoint. Refused states are counted separately and retried when
+the preparation identity changes. Previously used pipeline objects are loaded
+into the game process before execution.
 The pipeline recording and source fingerprint follow the approach in
 [carlm125/cool_fox](https://github.com/carlm125/cool_fox).
 
@@ -159,6 +193,7 @@ see `victory.example.toml` and `docs/architecture.md`.
 - `docs/fork-ray-tracing.md` — BVH/RT translation status
 - `docs/asset-policy.md` — no game assets in this repository
 - [AMD fork comparison and RX 570 fixes](docs/amd-comparison-2026-11-27.md)
+- [RX 570 Shader Model and Agility investigation](docs/rx570-agility.md)
 
 ## AMD work and credits
 

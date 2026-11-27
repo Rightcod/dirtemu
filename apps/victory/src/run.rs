@@ -37,7 +37,16 @@ pub fn run(
         crate::precompile::record(&cfg, hash.as_str(), console)?;
     }
     if precompile {
-        crate::precompile::prepare(&cfg, exe, hash.as_str(), console, None, None, used_only)?;
+        crate::precompile::prepare(
+            &cfg,
+            exe,
+            hash.as_str(),
+            console,
+            None,
+            None,
+            used_only,
+            true,
+        )?;
     }
     let image = victory_loader::load(&prepared, &images)?;
     // The program is mapped from the copy `load` wrote: the file's bytes

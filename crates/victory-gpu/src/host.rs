@@ -595,18 +595,26 @@ fn create() -> windows::core::Result<Host> {
         // while `VICTORY_SHADER_PROFILE=sm65|sm66` stays an explicit choice
         // and is refused when the device cannot run it.
         let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
-            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+            HighestShaderModel: D3D_SHADER_MODEL_6_7,
         };
-        device
-            .CheckFeatureSupport(
+        let queried = device.CheckFeatureSupport(
+            D3D12_FEATURE_SHADER_MODEL,
+            (&raw mut model).cast(),
+            size_of_val(&model) as u32,
+        );
+        if queried
+            .as_ref()
+            .is_err_and(|error| error.code() == windows::Win32::Foundation::E_INVALIDARG)
+        {
+            model.HighestShaderModel = D3D_SHADER_MODEL_6_6;
+            device.CheckFeatureSupport(
                 D3D12_FEATURE_SHADER_MODEL,
                 (&raw mut model).cast(),
                 size_of_val(&model) as u32,
-            )
-            .map_err(|e| {
-                tracing::error!(error = %e, "cannot query the host's highest shader model");
-                e
-            })?;
+            )?;
+        } else {
+            queried?;
+        }
         let highest = model.HighestShaderModel.0 as u32;
         let resolved = victory_shader::emit::set_host_shader_model(highest).map_err(|e| {
             tracing::error!(
@@ -621,6 +629,45 @@ fn create() -> windows::core::Result<Host> {
             request = resolved.request.cache_key(),
             profile = resolved.profile.cache_key(),
             "host shader profile selected"
+        );
+        let mut options3 = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+        let barycentrics = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS3,
+                (&raw mut options3).cast(),
+                size_of_val(&options3) as u32,
+            )
+            .is_ok()
+            && options3.BarycentricsSupported.as_bool();
+        let mut options9 = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+        let typed_atomic64 = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS9,
+                (&raw mut options9).cast(),
+                size_of_val(&options9) as u32,
+            )
+            .is_ok()
+            && options9.AtomicInt64OnTypedResourceSupported.as_bool();
+        let mut options11 = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+        let heap_atomic64 = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS11,
+                (&raw mut options11).cast(),
+                size_of_val(&options11) as u32,
+            )
+            .is_ok()
+            && options11
+                .AtomicInt64OnDescriptorHeapResourceSupported
+                .as_bool();
+        victory_shader::emit::set_host_shader_features(
+            barycentrics,
+            typed_atomic64 && heap_atomic64,
+        );
+        tracing::info!(
+            barycentrics,
+            typed_atomic64,
+            heap_atomic64,
+            "host optional shader features"
         );
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
         // driver compiling shaders again on the "D3D Background Thread"s,
@@ -1778,7 +1825,10 @@ enum Step {
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>),
+    Texture(
+        std::sync::Arc<crate::texture::Staging>,
+        std::sync::Arc<crate::resource::HostTexture>,
+    ),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -5224,20 +5274,34 @@ impl HostList {
         let mut barriers = Vec::new();
         let mut copying = std::collections::HashMap::new();
         let deferred = self.deferred();
-        let uploads: Vec<_> = deferred.copies.iter().filter_map(|step| {
-            if let Step::Texture(staging, copy) = step {
-                staging.claim_upload().then_some((staging, copy))
-            } else { None }
-        }).collect();
+        let uploads: Vec<_> = deferred
+            .copies
+            .iter()
+            .filter_map(|step| {
+                if let Step::Texture(staging, copy) = step {
+                    staging.claim_upload().then_some((staging, copy))
+                } else {
+                    None
+                }
+            })
+            .collect();
         for (_, texture) in &uploads {
             let key = std::sync::Arc::as_ptr(texture) as usize;
             let real = texture.state.load(Ordering::Relaxed);
             copying.insert(key, COPY_DEST);
             if real != COPY_DEST {
-                to_copy.push(transition(&texture.texture, host_state(real), host_state(COPY_DEST)));
+                to_copy.push(transition(
+                    &texture.texture,
+                    host_state(real),
+                    host_state(COPY_DEST),
+                ));
             }
             if !states.contains_key(&key) && real != COPY_DEST {
-                barriers.push(transition(&texture.texture, host_state(COPY_DEST), host_state(real)));
+                barriers.push(transition(
+                    &texture.texture,
+                    host_state(COPY_DEST),
+                    host_state(real),
+                ));
             }
         }
         for (depth, twin, colour) in &syncs {
@@ -5619,7 +5683,11 @@ impl HostList {
 
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>, copy: std::sync::Arc<crate::resource::HostTexture>) {
+    pub(crate) fn defer_texture(
+        &self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+    ) {
         self.deferred().copies.push(Step::Texture(staging, copy));
     }
 

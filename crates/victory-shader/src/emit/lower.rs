@@ -34,6 +34,8 @@ type Why = &'static str;
 pub(crate) fn check_wide_atomic(profile: ShaderProfile, wide: bool) -> Result<(), Why> {
     if wide && profile == ShaderProfile::Sm65 {
         Err("a 64-bit image atomic (SM 6.6)")
+    } else if wide && super::host_shader_features() & 2 == 0 {
+        Err("a 64-bit image atomic unsupported by the host device")
     } else {
         Ok(())
     }
@@ -2706,7 +2708,7 @@ impl<'a> Lower<'a> {
         }
         // One element per interpolation mode (the console's own, if its
         // signature declares one): DXIL allows two.
-        let emulated = self.s.profile == ShaderProfile::Sm65;
+        let emulated = super::software_barycentrics(self.s.profile);
         let bary = |e: &SigElement| e.kind == 28 || e.name == "VICTORY_BARYCENTRICS";
         let id = match self
             .s
@@ -9314,7 +9316,7 @@ impl<'a> Lower<'a> {
     /// Vertex `k` (0 the provoking vertex, as `barycentric` orders them)
     /// of a constant input element's channel, as a float.
     fn vertex_input(&mut self, id: usize, col: u8, k: u8) -> V {
-        if self.s.profile == ShaderProfile::Sm65 {
+        if super::software_barycentrics(self.s.profile) {
             let original = self.s.inputs[id].clone();
             let name = format!("VICTORY_VERTEX_{k}_{}", original.name);
             let alias = match self

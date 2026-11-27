@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
@@ -212,9 +212,50 @@ pub struct Report {
     pub built: usize,
     pub refused: usize,
     pub unreadable: usize,
+    pub cached: usize,
+    pub remaining: usize,
 }
 
-pub(super) fn precompile(jobs: usize, used_only: bool) -> anyhow::Result<Report> {
+fn completed(text: &str) -> HashMap<String, bool> {
+    text.lines()
+        .filter_map(|line| {
+            let (status, key) = line.split_at_checked(1)?;
+            let built = match status {
+                "+" => true,
+                "-" => false,
+                _ => return None,
+            };
+            (key.len() == 32 && key.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .then(|| (key.to_owned(), built))
+        })
+        .collect()
+}
+
+fn checkpoint(path: &Path, entries: &mut Vec<(String, bool)>) -> anyhow::Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        super::library::save_checked(true),
+        "pipeline cache could not be saved; preparation progress was not checkpointed"
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    for (key, built) in entries.iter() {
+        writeln!(file, "{}{key}", if *built { '+' } else { '-' })?;
+    }
+    file.sync_data()?;
+    entries.clear();
+    Ok(())
+}
+
+pub(super) fn precompile(
+    jobs: usize,
+    used_only: bool,
+    retain_used: bool,
+) -> anyhow::Result<Report> {
     let dir = DIR
         .get()
         .ok_or_else(|| anyhow::anyhow!("pipeline recipe cache is not configured"))?;
@@ -236,7 +277,57 @@ pub(super) fn precompile(jobs: usize, used_only: bool) -> anyhow::Result<Report>
     let mut report = Report::default();
     let total = files.len();
     println!("pipeline recipes  {total}");
+    let mut identity = blake3::Hasher::new();
+    identity.update(
+        crate::shader_cache::precompile_setup()
+            .map_err(anyhow::Error::msg)?
+            .as_bytes(),
+    );
+    identity.update(include_bytes!("host.rs"));
+    identity.update(include_bytes!("../root.rs"));
+    identity.update(b"pipeline-preparation-journal-v1");
+    let journal = dir.join(format!("prepared-{}.txt", identity.finalize().to_hex()));
+    if !super::library::warm_cache_loaded() && journal.exists() {
+        std::fs::remove_file(&journal)?;
+    }
+    let previous = match std::fs::read_to_string(&journal) {
+        Ok(text) => completed(&text),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => HashMap::new(),
+        Err(error) => return Err(error.into()),
+    };
+    files.retain(|(unused, path)| {
+        let Some(key) = path.file_name().and_then(|name| name.to_str()) else {
+            return true;
+        };
+        let Some(&built) = previous.get(key) else {
+            return true;
+        };
+        if retain_used && !unused && built {
+            return true;
+        }
+        report.cached += 1;
+        if built {
+            report.built += 1
+        } else {
+            report.refused += 1
+        }
+        false
+    });
+    let limit = std::env::var("VICTORY_PRECOMPILE_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(usize::MAX)
+        .max(1);
+    report.remaining = files.len().saturating_sub(limit);
+    files.truncate(limit);
+    println!(
+        "pipeline prepared {} from cache, {} to process in this worker, {} remaining",
+        report.cached,
+        files.len(),
+        report.remaining
+    );
     let mut ready = HashMap::new();
+    let mut updated = Vec::new();
     for (index, batch) in files.chunks(128).enumerate() {
         let prepared = Mutex::new(Vec::new());
         let remaining = Mutex::new(batch.iter());
@@ -264,12 +355,13 @@ pub(super) fn precompile(jobs: usize, used_only: bool) -> anyhow::Result<Report>
         for result in prepared.into_inner().unwrap_or_else(|e| e.into_inner()) {
             match result {
                 Ok((pipeline, built, used)) => {
+                    updated.push((pipeline.key().to_owned(), built));
                     if built {
                         report.built += 1;
                     } else {
                         report.refused += 1;
                     }
-                    if used {
+                    if used && retain_used {
                         ready.insert(
                             pipeline.key().to_owned(),
                             Prepared {
@@ -285,13 +377,15 @@ pub(super) fn precompile(jobs: usize, used_only: bool) -> anyhow::Result<Report>
                 }
             }
         }
-        super::library::save(false);
+        if (index + 1).is_multiple_of(4) {
+            checkpoint(&journal, &mut updated)?;
+        }
         println!(
             "pipeline states   {}/{total} processed",
-            index * 128 + batch.len()
+            report.cached + index * 128 + batch.len()
         );
     }
-    super::library::save(true);
+    checkpoint(&journal, &mut updated)?;
     let _ = PREPARED.set(Mutex::new(ready));
     Ok(report)
 }
@@ -299,6 +393,20 @@ pub(super) fn precompile(jobs: usize, used_only: bool) -> anyhow::Result<Report>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparation_journal_ignores_torn_records_and_keeps_latest_outcome() {
+        let first = "0123456789abcdef0123456789abcdef";
+        let second = "abcdef0123456789abcdef0123456789";
+        let text = format!(
+            "+{first}\n-{second}\n-{first}\n+{first}\n+bad\n?{second}\n+{second}truncated\n"
+        );
+        let entries = completed(&text);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.get(first), Some(&true));
+        assert_eq!(entries.get(second), Some(&false));
+        assert!(completed("+0123456789abcdef").is_empty());
+    }
 
     #[test]
     fn pipeline_recipes_reload_states_and_reject_changed_shader_bytes() {

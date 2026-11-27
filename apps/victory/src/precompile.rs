@@ -17,6 +17,7 @@ mod windows {
         inputs: Option<&[PathBuf]>,
         jobs: Option<usize>,
         used_only: bool,
+        retain_used: bool,
     ) -> Result<()> {
         let jobs = jobs
             .unwrap_or_else(|| {
@@ -25,16 +26,30 @@ mod windows {
             })
             .clamp(1, 16);
         let tag = victory_gpu::shader_cache::precompile_setup().map_err(anyhow::Error::msg)?;
-        let cache = cfg.cache_subdir("shader-scan")?;
-        let paths = match inputs {
-            Some(paths) if !paths.is_empty() => paths.to_vec(),
-            _ => files(exe)?,
-        };
-        let seen = Mutex::new(HashSet::new());
-        for path in paths {
-            scan(&path, &cache, tag, jobs, &seen)?;
+        let worker = std::env::var("VICTORY_PRECOMPILE_WORKER").is_ok_and(|value| value == "1");
+        if !worker {
+            let cache = cfg.cache_subdir("shader-scan")?;
+            let paths = match inputs {
+                Some(paths) if !paths.is_empty() => paths.to_vec(),
+                _ => files(exe)?,
+            };
+            let seen = Mutex::new(HashSet::new());
+            for path in paths {
+                scan(&path, &cache, tag, jobs, &seen)?;
+            }
         }
-        let report = victory_gpu::pipeline::precompile_pipelines(jobs, used_only)?;
+        let report = if worker {
+            victory_gpu::pipeline::precompile_pipelines(jobs, used_only, false)?
+        } else {
+            let report = prepare_isolated(exe, console, jobs, used_only)?;
+            if retain_used {
+                println!(
+                    "pipeline objects  loading previously used states from the prepared cache"
+                );
+                victory_gpu::pipeline::precompile_pipelines(jobs, true, true)?;
+            }
+            report
+        };
         println!(
             "pipeline cache    {} ready, {} refused, {} unreadable ({}, {})",
             report.built,
@@ -43,7 +58,152 @@ mod windows {
             console_name(console),
             &title_hash[..12]
         );
+        println!(
+            "pipeline result {} {} {} {} {}",
+            report.built, report.refused, report.unreadable, report.cached, report.remaining
+        );
         Ok(())
+    }
+
+    fn parse_report(line: &str) -> Option<victory_gpu::pipeline::PipelinePrecompileReport> {
+        let numbers: Vec<usize> = line
+            .strip_prefix("pipeline result ")?
+            .split_whitespace()
+            .map(str::parse)
+            .collect::<std::result::Result<_, _>>()
+            .ok()?;
+        let [built, refused, unreadable, cached, remaining] = numbers.as_slice() else {
+            return None;
+        };
+        Some(victory_gpu::pipeline::PipelinePrecompileReport {
+            built: *built,
+            refused: *refused,
+            unreadable: *unreadable,
+            cached: *cached,
+            remaining: *remaining,
+        })
+    }
+
+    #[cfg(test)]
+    mod report_tests {
+        use super::parse_report;
+
+        #[test]
+        fn worker_results_keep_cached_and_remaining_counts() {
+            let report = parse_report("pipeline result 2000 48 0 1024 80000").unwrap();
+            assert_eq!(
+                (
+                    report.built,
+                    report.refused,
+                    report.unreadable,
+                    report.cached,
+                    report.remaining
+                ),
+                (2000, 48, 0, 1024, 80000)
+            );
+            assert!(parse_report("pipeline result 2000 48 0 1024").is_none());
+            assert!(parse_report("pipeline result 2000 bad 0 1024 0").is_none());
+            assert!(parse_report("shader records 2000/26503 processed").is_none());
+        }
+    }
+
+    fn prepare_isolated(
+        exe: &Path,
+        console: Console,
+        jobs: usize,
+        used_only: bool,
+    ) -> Result<victory_gpu::pipeline::PipelinePrecompileReport> {
+        use std::io::{BufRead, BufReader};
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let binary = std::env::current_exe()?;
+        let mut previous = usize::MAX;
+        loop {
+            let mut command = Command::new(&binary);
+            command
+                .arg("precompile")
+                .arg(exe)
+                .arg("--console")
+                .arg(console_name(console))
+                .arg("--jobs")
+                .arg(jobs.to_string())
+                .env("VICTORY_PRECOMPILE_WORKER", "1")
+                .env("VICTORY_PRECOMPILE_LIMIT", "2048")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .creation_flags(0x0800_0000);
+            if used_only {
+                command.arg("--used-only");
+            }
+            let mut child = command
+                .spawn()
+                .context("starting pipeline preparation worker")?;
+            let output = child
+                .stdout
+                .take()
+                .context("pipeline worker has no output pipe")?;
+            let (send, receive) = mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                for line in BufReader::new(output).lines() {
+                    if send.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+            let mut report = None;
+            let mut failure = None;
+            loop {
+                match receive.recv_timeout(Duration::from_secs(300)) {
+                    Ok(Ok(line)) => {
+                        if let Some(result) = parse_report(&line) {
+                            report = Some(result);
+                        }
+                        println!("{line}");
+                    }
+                    Ok(Err(error)) => {
+                        failure = Some(anyhow::Error::from(error));
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        failure = Some(anyhow::anyhow!(
+                            "pipeline worker produced no progress for 300 seconds; completed batches are kept"
+                        ));
+                        break;
+                    }
+                }
+            }
+            if failure.is_some() {
+                let _ = child.kill();
+            }
+            let status = child.wait()?;
+            reader
+                .join()
+                .map_err(|_| anyhow::anyhow!("pipeline worker output reader failed"))?;
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            anyhow::ensure!(
+                status.success(),
+                "pipeline worker exited with {status}; completed batches are kept"
+            );
+            let report = report.context("pipeline worker did not report its result")?;
+            anyhow::ensure!(
+                report.unreadable == 0,
+                "pipeline preparation found {} unreadable recipes",
+                report.unreadable
+            );
+            if report.remaining == 0 {
+                return Ok(report);
+            }
+            anyhow::ensure!(
+                report.remaining < previous,
+                "pipeline preparation made no checkpointed progress"
+            );
+            previous = report.remaining;
+        }
     }
 
     pub fn record(cfg: &victory_core::Config, build: &str, console: Console) -> Result<()> {

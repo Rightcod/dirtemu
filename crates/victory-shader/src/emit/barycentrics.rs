@@ -121,7 +121,9 @@ pub fn barycentric_gs(vs: &[u8], ps: &[u8]) -> Result<Option<Vec<u8>>, ShaderErr
         .part(FourCC::OSG1)
         .ok_or_else(|| unsupported("a vertex stage without output signature"))?;
     let outputs = super::signature(outputs.data)?;
-    build(outputs, &wanted).map(Some)
+    let profile = super::rect::profile_of(vs)
+        .ok_or_else(|| unsupported("a vertex shader with an unknown profile"))?;
+    build(outputs, &wanted, profile).map(Some)
 }
 
 fn load(s: &mut Shader, input: usize, column: u8, vertex: u32) -> V {
@@ -139,7 +141,11 @@ fn load(s: &mut Shader, input: usize, column: u8, vertex: u32) -> V {
     s.op(s.entry, name, Attr::ReadNone, ty, 4, &args)
 }
 
-fn build(mut outputs: Vec<SigElement>, wanted: &[SigElement]) -> Result<Vec<u8>, ShaderError> {
+fn build(
+    mut outputs: Vec<SigElement>,
+    wanted: &[SigElement],
+    profile: super::ShaderProfile,
+) -> Result<Vec<u8>, ShaderError> {
     for output in &mut outputs {
         output.interp = match (output.kind, output.comp) {
             (3, _) => 4,
@@ -149,7 +155,7 @@ fn build(mut outputs: Vec<SigElement>, wanted: &[SigElement]) -> Result<Vec<u8>,
         };
         output.usage = (1 << output.cols) - 1;
     }
-    let mut s = Shader::new(false, super::ShaderProfile::Sm65);
+    let mut s = Shader::new(false, profile);
     s.geometry = Some(Geometry { max_vertices: 3 });
     s.inputs = outputs.clone();
     s.outputs = outputs;
