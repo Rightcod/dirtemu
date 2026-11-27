@@ -80,6 +80,7 @@
 //!   shaders and draws triangle lists with the title's own vertex counts.
 //!   It binds nothing.
 
+mod barycentrics;
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
@@ -113,6 +114,7 @@ use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
+pub use barycentrics::barycentric_gs;
 pub use bitcode::census;
 pub use lower::set_host_max_wave;
 
@@ -1696,7 +1698,13 @@ mod barycentric_tests {
     #[test]
     fn pixel_quad_swizzle_without_discard_validates() {
         let [out0, out1] = exp_mrt0(2);
-        let words = [0x36 << 26 | 0x35 << 18 | 0x80b1, 2 << 24, out0, out1, 0xBF81_0000];
+        let words = [
+            0x36 << 26 | 0x35 << 18 | 0x80b1,
+            2 << 24,
+            out0,
+            out1,
+            0xBF81_0000,
+        ];
         let shader = pixel(&words, PERSP_CENTER).unwrap();
         assert_ne!(parts(&shader).0 & 0x4000, 0);
         validate(&shader);

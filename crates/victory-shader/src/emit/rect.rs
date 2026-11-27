@@ -154,6 +154,12 @@ fn build(
         ));
     }
     s.outputs = outputs;
+    let varyings = super::barycentrics::append(&mut s, ps_inputs)?;
+    if s.outputs.iter().map(|e| u32::from(e.cols)).sum::<u32>() * VERTICES > MAX_SCALARS {
+        return Err(unsupported(
+            "software rectangle barycentrics exceeding geometry output limits",
+        ));
+    }
     let b = s.entry;
 
     // Every input of the three vertices: [element][column][vertex].
@@ -259,6 +265,15 @@ fn build(
         if let Some((id, n)) = number {
             let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(0), n];
             s.op(b, "storeOutput.i32", Attr::NoUnwind, s.t.void, 5, &args);
+        }
+        for varying in &varyings {
+            for column in 0..s.outputs[varying.output].cols as usize {
+                let value = match varying.source {
+                    Some((input, from)) => emitted[input][column][vertex / 3 * 3 + from as usize],
+                    None => super::barycentrics::weight(&mut s, vertex % 3, column),
+                };
+                super::barycentrics::store(&mut s, varying.output, column as u8, value);
+            }
         }
         s.op(b, "emitStream", Attr::NoUnwind, s.t.void, 97, &[stream]);
         // The strip ends after the first triangle.

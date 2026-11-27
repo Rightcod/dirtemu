@@ -2706,7 +2706,8 @@ impl<'a> Lower<'a> {
         }
         // One element per interpolation mode (the console's own, if its
         // signature declares one): DXIL allows two.
-        let bary = |e: &SigElement| e.kind == 28;
+        let emulated = self.s.profile == ShaderProfile::Sm65;
+        let bary = |e: &SigElement| e.kind == 28 || e.name == "VICTORY_BARYCENTRICS";
         let id = match self
             .s
             .inputs
@@ -2740,9 +2741,25 @@ impl<'a> Lower<'a> {
         if e.col != 0 || e.cols < 3 {
             return Val::Missing("a console barycentrics element without i and j");
         }
-        e.row = None;
         e.interp = mode;
-        self.s.flags |= flags::BARYCENTRICS;
+        if emulated {
+            let row = self
+                .s
+                .inputs
+                .iter()
+                .filter_map(|e| e.row)
+                .max()
+                .map_or(0, |r| r + 1);
+            let e = &mut self.s.inputs[id];
+            if e.kind == 28 {
+                e.name = "VICTORY_BARYCENTRICS".into();
+                e.kind = 0;
+                e.row = Some(row);
+            }
+        } else {
+            self.s.inputs[id].row = None;
+            self.s.flags |= flags::BARYCENTRICS;
+        }
         self.load_any_input(id, index + 1)
     }
 
@@ -9297,6 +9314,40 @@ impl<'a> Lower<'a> {
     /// Vertex `k` (0 the provoking vertex, as `barycentric` orders them)
     /// of a constant input element's channel, as a float.
     fn vertex_input(&mut self, id: usize, col: u8, k: u8) -> V {
+        if self.s.profile == ShaderProfile::Sm65 {
+            let original = self.s.inputs[id].clone();
+            let name = format!("VICTORY_VERTEX_{k}_{}", original.name);
+            let alias = match self
+                .s
+                .inputs
+                .iter()
+                .position(|e| e.name == name && e.index == original.index)
+            {
+                Some(alias) => alias,
+                None => {
+                    let row = self
+                        .s
+                        .inputs
+                        .iter()
+                        .filter_map(|e| e.row)
+                        .max()
+                        .map_or(0, |r| r + 1);
+                    self.s.inputs.push(SigElement {
+                        name,
+                        kind: 0,
+                        interp: 1,
+                        row: Some(row),
+                        usage: 0,
+                        ..original
+                    });
+                    self.s.inputs.len() - 1
+                }
+            };
+            return match self.load_any_input(alias, col) {
+                Val::I32(value) => self.as_float(value),
+                _ => unreachable!("software vertex input must be a signature value"),
+            };
+        }
         let e = &mut self.s.inputs[id];
         e.usage |= 1 << col;
         let int = e.comp != 9;

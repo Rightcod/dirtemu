@@ -53,3 +53,30 @@ discontinuous physical views, GPU reads and writes across reserved-section views
 pixel quad translation validation, and texture data changed after command
 recording. Performance and screenshot comparisons require a new game run after
 the full shader/pipeline preparation completes.
+
+## Additional RX 570 capability failures
+
+A separate cache of 53 pipeline states selected from driver refusals exposed
+unsupported barycentric pixel inputs and conservative rasterization in the
+D3D12 debug layer. The first snapshot contained 36 states and rejected all 36.
+
+SM 6.5 translations now replace barycentric system inputs and per-vertex
+attribute reads with user interpolants produced by a geometry stage. This is
+integrated into ordinary triangles, rectangle completion, and compute-emulated
+mesh draws. Geometry outputs use the pixel signature's registers and move
+unused vertex outputs aside when those registers overlap. Signature overflow
+remains an explicit refusal.
+
+The hardware test renders perspective and linear barycentric weights and
+per-vertex attributes across an entire target with unequal clip-space W,
+and compares every output pixel with independently computed values.
+All 53 selected states then created successfully on the RX 570 with the D3D12
+debug layer, with zero refused or unreadable states.
+
+Conservative rasterization on unsupported devices falls back to ordinary
+raster coverage. This preserves the draw but does not reproduce conservative
+edge coverage. A new in-game comparison is still required.
+
+The first full warm processed all archive shaders and 17,792 of 83,562 PSO states
+before this translator correction. Its cache files were retained. A new full
+warm must use the final translator key before the title is run.

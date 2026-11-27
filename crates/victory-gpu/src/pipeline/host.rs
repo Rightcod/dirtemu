@@ -23,17 +23,27 @@ use crate::host::host;
 fn integer_target(format: DXGI_FORMAT) -> bool {
     matches!(
         format,
-        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32A32_SINT
-            | DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT
-            | DXGI_FORMAT_R16G16B16A16_UINT | DXGI_FORMAT_R16G16B16A16_SINT
-            | DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32G32_SINT
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
             | DXGI_FORMAT_R10G10B10A2_UINT
-            | DXGI_FORMAT_R8G8B8A8_UINT | DXGI_FORMAT_R8G8B8A8_SINT
-            | DXGI_FORMAT_R16G16_UINT | DXGI_FORMAT_R16G16_SINT
-            | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT
-            | DXGI_FORMAT_R8G8_UINT | DXGI_FORMAT_R8G8_SINT
-            | DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R16_SINT
-            | DXGI_FORMAT_R8_UINT | DXGI_FORMAT_R8_SINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
     )
 }
 
@@ -42,7 +52,9 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
     let independent = blend.IndependentBlendEnable.as_bool();
     if !(0..count).any(|i| {
         integer_target(targets.RTFormats[i])
-            && blend.RenderTarget[if independent { i } else { 0 }].BlendEnable.as_bool()
+            && blend.RenderTarget[if independent { i } else { 0 }]
+                .BlendEnable
+                .as_bool()
     }) {
         return *blend;
     }
@@ -59,6 +71,38 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
     result
 }
 
+fn host_rasterizer(rasterizer: D3D12_RASTERIZER_DESC) -> D3D12_RASTERIZER_DESC {
+    if rasterizer.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF {
+        return rasterizer;
+    }
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let supported = *SUPPORTED.get_or_init(|| {
+        let Some(host) = host() else { return false };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.ConservativeRasterizationTier
+                != D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED
+    });
+    if supported {
+        return rasterizer;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!("conservative rasterization unavailable: using ordinary raster coverage")
+    });
+    D3D12_RASTERIZER_DESC {
+        ConservativeRaster: D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF,
+        ..rasterizer
+    }
+}
+
 #[cfg(test)]
 mod integer_blend_tests {
     use super::*;
@@ -69,9 +113,14 @@ mod integer_blend_tests {
         blend.RenderTarget[0].BlendEnable = true.into();
         blend.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
         blend.RenderTarget[0].RenderTargetWriteMask = 3;
-        let mut targets = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 3, ..Default::default() };
+        let mut targets = D3D12_RT_FORMAT_ARRAY {
+            NumRenderTargets: 3,
+            ..Default::default()
+        };
         targets.RTFormats[..3].copy_from_slice(&[
-            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R8_UINT,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
         ]);
         let result = host_blend(&blend, &targets);
         assert!(result.IndependentBlendEnable.as_bool());
@@ -90,9 +139,14 @@ mod integer_blend_tests {
         blend.RenderTarget[0].BlendEnable = true.into();
         blend.RenderTarget[1].BlendEnable = true.into();
         blend.RenderTarget[1].RenderTargetWriteMask = 1;
-        let mut targets = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 2, ..Default::default() };
+        let mut targets = D3D12_RT_FORMAT_ARRAY {
+            NumRenderTargets: 2,
+            ..Default::default()
+        };
         targets.RTFormats[..3].copy_from_slice(&[
-            DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R8_UINT,
+            DXGI_FORMAT_R16G16_FLOAT,
+            DXGI_FORMAT_R32_SINT,
+            DXGI_FORMAT_R8_UINT,
         ]);
         let result = host_blend(&blend, &targets);
         assert_eq!(result.RenderTarget[0], blend.RenderTarget[0]);
@@ -882,13 +936,35 @@ impl HostPipeline {
                     return None;
                 }
             };
+            let barycentric_gs = if code(1).BytecodeLength > 0 {
+                match victory_shader::emit::barycentric_gs(
+                    &emulated.vertex_shader,
+                    &code_bytes(&code(1)),
+                ) {
+                    Ok(gs) => gs,
+                    Err(error) => {
+                        tracing::warn!(%error, ?shaders, "mesh barycentrics geometry stage refused");
+                        return None;
+                    }
+                }
+            } else {
+                None
+            };
             let draw_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: unsafe { std::mem::transmute_copy(&root) },
                 VS: vs,
                 PS: code(1),
+                GS: barycentric_gs
+                    .as_ref()
+                    .map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
+                        D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: gs.as_ptr().cast(),
+                            BytecodeLength: gs.len(),
+                        }
+                    }),
                 BlendState: host_blend(&g.blend, &g.targets),
                 SampleMask: g.sample_mask,
-                RasterizerState: g.rasterizer,
+                RasterizerState: host_rasterizer(g.rasterizer),
                 DepthStencilState: g.depth,
                 IBStripCutValue: g.strip_cut,
                 PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
@@ -901,7 +977,11 @@ impl HostPipeline {
             let draw_name = super::library::name(
                 "mesh draw fallback v1",
                 &root_blob,
-                &[&emulated.vertex_shader, &code_bytes(&code(1))],
+                &[
+                    &emulated.vertex_shader,
+                    &code_bytes(&code(1)),
+                    barycentric_gs.as_deref().unwrap_or(&[]),
+                ],
                 &state,
             );
             let pso = match super::library::pipeline(
@@ -996,6 +1076,17 @@ impl HostPipeline {
                 Ok(gs) => rect_gs = Some(gs),
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
             }
+        } else if let Some(pixel) = stages.get(1).and_then(|(s, _)| s.translated()) {
+            match victory_shader::emit::barycentric_gs(
+                &stages[0].0.translated()?.host.dxil,
+                &pixel.host.dxil,
+            ) {
+                Ok(gs) => rect_gs = gs,
+                Err(error) => {
+                    tracing::warn!(%error, ?shaders, "barycentrics geometry stage refused");
+                    return None;
+                }
+            }
         }
         let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
@@ -1012,7 +1103,7 @@ impl HostPipeline {
                 }),
             BlendState: host_blend(&g.blend, &g.targets),
             SampleMask: g.sample_mask,
-            RasterizerState: g.rasterizer,
+            RasterizerState: host_rasterizer(g.rasterizer),
             DepthStencilState: g.depth,
             InputLayout: D3D12_INPUT_LAYOUT_DESC {
                 pInputElementDescs: g.inputs.as_ptr(),
@@ -1057,7 +1148,7 @@ impl HostPipeline {
             )
         };
         let mut made = make(&desc, &name(rect_gs.as_ref()));
-        if made.is_err() && rect_gs.is_some() {
+        if made.is_err() && rect_gs.is_some() && g.topology.0 == RECTANGLES {
             // The host refused the geometry stage: once more without it.
             tracing::warn!(
                 ?shaders,
@@ -1102,7 +1193,7 @@ impl HostPipeline {
             name: format!("{shaders:?}"),
             slots: g.slots(),
             inputs: g.elements(),
-            rects: rect_gs.is_some(),
+            rects: rect_gs.is_some() && g.topology.0 == RECTANGLES,
             state: {
                 let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
                 let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
@@ -1181,12 +1272,18 @@ fn mesh_pipeline(
         ),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, host_blend(&g.blend, &g.targets)),
+        blend: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND,
+            host_blend(&g.blend, &g.targets),
+        ),
         mask: Sub(
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
             g.sample_mask,
         ),
-        raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
+        raster: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER,
+            host_rasterizer(g.rasterizer),
+        ),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
         targets: Sub(
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
