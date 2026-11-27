@@ -1585,11 +1585,35 @@ static COPY_BUDGET: Mutex<()> = Mutex::new(());
 /// Whether a host copy of `size` bytes fits the profile. The cap counts every
 /// copy (buffers and windows outside buffers) and is the PC's memory; a copy
 /// past it is refused instead of ending the run in the paging file.
-fn admit_host_copy(size: u64) -> bool {
+fn admit_host_copy(size: u64, windows: Option<&mut BTreeMap<(u64, u64), Arc<Shadow>>>) -> bool {
     let limits = crate::console::limits();
-    let used = LIVE[1].load(Ordering::Relaxed);
+    let mut used = LIVE[1].load(Ordering::Relaxed);
     if limits.admits_host_copy(used, size) {
         return true;
+    }
+    let needed = used
+        .saturating_add(size)
+        .saturating_sub(limits.host_copy_bytes);
+    let released = if size > limits.host_copy_bytes {
+        0
+    } else {
+        match windows {
+            Some(windows) => release_unused_windows(windows, needed),
+            None => LOOSE.try_lock().ok().map_or(0, |mut windows| {
+                release_unused_windows(&mut windows, needed)
+            }),
+        }
+    };
+    if released != 0 {
+        used = LIVE[1].load(Ordering::Relaxed);
+        tracing::info!(
+            released_mb = released >> 20,
+            used_mb = used >> 20,
+            "unused host windows released under copy-memory pressure"
+        );
+        if limits.admits_host_copy(used, size) {
+            return true;
+        }
     }
     static REFUSED: AtomicU64 = AtomicU64::new(0);
     let n = REFUSED.fetch_add(1, Ordering::Relaxed);
@@ -1603,6 +1627,37 @@ fn admit_host_copy(size: u64) -> bool {
         );
     }
     false
+}
+
+fn release_unused_windows(windows: &mut BTreeMap<(u64, u64), Arc<Shadow>>, needed: u64) -> u64 {
+    let mut candidates: Vec<_> = windows
+        .iter()
+        .filter(|(_, shadow)| {
+            shadow.place.is_none()
+                && Arc::strong_count(shadow) == 1
+                && crate::host::references(&shadow.buffer) == 1
+                && shadow
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty()
+        })
+        .map(|(key, shadow)| (shadow.used.load(Ordering::Relaxed), *key))
+        .collect();
+    candidates.sort_unstable();
+    let mut released = 0;
+    for (_, key) in candidates {
+        if released >= needed {
+            break;
+        }
+        if let Some(shadow) = windows.remove(&key) {
+            released += shadow.len;
+            LET_GO[0].fetch_add(1, Ordering::Relaxed);
+            LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
+            drop(shadow);
+        }
+    }
+    released
 }
 
 impl Drop for Shadow {
@@ -3141,7 +3196,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             return entry.shadow.clone();
         }
         let _budget = COPY_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
-        if !admit_host_copy(size) {
+        if !admit_host_copy(size, None) {
             return None;
         }
         let (buffer, data) = host()?.shared_buffer(size)?;
@@ -3385,7 +3440,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::port::place_for(start, len, true)
-        .or_else(|| crate::inplace::place_for(start, len, true)) {
+        .or_else(|| crate::inplace::place_for(start, len, true))
+    {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
@@ -3393,7 +3449,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     // The profile's cap on host copies, as for title buffers.
     let _budget = COPY_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
-    if !admit_host_copy(len) {
+    if !admit_host_copy(len, Some(&mut map)) {
         return None;
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -3598,4 +3654,88 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod pressure_tests {
+    use super::*;
+
+    #[test]
+    fn copy_pressure_reclaims_only_unreferenced_windows_without_pending_writes() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows::core::Interface;
+
+        let device: ID3D12Device = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+            let description = adapter.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap();
+            assert_ne!(description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0);
+            let mut device = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device).unwrap();
+            device.unwrap()
+        };
+        const SIZE: u64 = 65536;
+        let mut windows = BTreeMap::new();
+        for index in 1..=4 {
+            let (buffer, data): (ID3D12Resource, *mut u8) = unsafe {
+                let mut buffer = None;
+                device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_UPLOAD,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: SIZE,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_GENERIC_READ,
+                        None,
+                        &mut buffer,
+                    )
+                    .unwrap();
+                let buffer: ID3D12Resource = buffer.unwrap();
+                let mut data = std::ptr::null_mut();
+                buffer.Map(0, None, Some(&mut data)).unwrap();
+                (buffer, data.cast())
+            };
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let mut shadow = Shadow::new(buffer, data, gpu, index * SIZE, SIZE);
+            shadow.window = true;
+            shadow.used.store(index, Ordering::Relaxed);
+            windows.insert((index * SIZE, SIZE), Arc::new(shadow));
+        }
+        let list_pin = windows[&(2 * SIZE, SIZE)].clone();
+        let descriptor_pin = windows[&(3 * SIZE, SIZE)].buffer.clone();
+        windows[&(4 * SIZE, SIZE)]
+            .pending
+            .lock()
+            .unwrap()
+            .push((0, 4));
+        assert_eq!(release_unused_windows(&mut windows, SIZE * 4), SIZE);
+        assert!(!windows.contains_key(&(SIZE, SIZE)));
+        assert_eq!(windows.len(), 3);
+        drop(list_pin);
+        drop(descriptor_pin);
+        assert_eq!(release_unused_windows(&mut windows, SIZE), SIZE);
+        assert!(!windows.contains_key(&(2 * SIZE, SIZE)));
+        assert!(windows.contains_key(&(3 * SIZE, SIZE)));
+        assert_eq!(release_unused_windows(&mut windows, SIZE * 4), SIZE);
+        assert!(windows.contains_key(&(4 * SIZE, SIZE)));
+        windows[&(4 * SIZE, SIZE)].pending.lock().unwrap().clear();
+        assert_eq!(release_unused_windows(&mut windows, SIZE), SIZE);
+        assert!(windows.is_empty());
+    }
 }

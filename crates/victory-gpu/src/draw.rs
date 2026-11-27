@@ -1107,7 +1107,12 @@ impl State {
                         continue;
                     }
                     let Some(mut gpu) = root_view(list, address, srv) else {
-                        continue;
+                        once!(
+                            slot,
+                            address = format_args!("{address:#x}"),
+                            "a required root buffer could not be prepared: draw or dispatch dropped"
+                        );
+                        return false;
                     };
                     if biased {
                         gpu -= u64::from(self.host_word(
@@ -1243,6 +1248,10 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
+                if address.is_some() && shadow.is_none() {
+                    once!("a required root UAV buffer is unavailable: draw or dispatch dropped");
+                    return false;
+                }
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
@@ -1319,6 +1328,10 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+                if address.is_some() && shadow.is_none() {
+                    once!("a required root SRV buffer is unavailable: draw or dispatch dropped");
+                    return false;
+                }
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };

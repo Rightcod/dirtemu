@@ -59,6 +59,10 @@ Latest validation on the RX 570:
 
 Known limitations:
 
+- A Series S SM 6.6 run on 27 November lost the display signal after desktop
+  artifacts; Windows recorded a video-engine timeout. Host-copy pressure and
+  stale root-buffer binding faults were corrected, but the exact GPU fault
+  and gameplay stability remain unverified. See [the incident analysis](docs/rx570-gpu-timeout-2026-11-27.md).
 - The complete SM 6.6 archive pass prepared **25,586 translations**, refused
   303 records and skipped 614 duplicates out of 26,503 records. All 679 records
   previously refused for SM 6.6 image atomics now translate. Of the remaining
@@ -203,6 +207,7 @@ see `victory.example.toml` and `docs/architecture.md`.
 - `docs/asset-policy.md` — no game assets in this repository
 - [AMD fork comparison and RX 570 fixes](docs/amd-comparison-2026-11-27.md)
 - [RX 570 Shader Model and Agility investigation](docs/rx570-agility.md)
+- [RX 570 video-engine timeout investigation](docs/rx570-gpu-timeout-2026-11-27.md)
 
 ## AMD work and credits
 
