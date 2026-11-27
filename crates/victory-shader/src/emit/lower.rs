@@ -1110,6 +1110,15 @@ fn lane_constant_masks(st: &Structured) -> bool {
 /// The widest wave the host GPU runs (0: not known – no host-specific forms); see
 /// [`set_host_max_wave`].
 static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static HOST_MIN_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn set_host_min_wave(lanes: u32) {
+    HOST_MIN_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(super) fn host_min_wave() -> u32 {
+    HOST_MIN_WAVE.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// The host GPU's `WaveLaneCountMax`: 32 lets console wave64 compute programs whose cross-lane
 /// code stays inside 32-lane halves run in waves of 32 instead of being refused.

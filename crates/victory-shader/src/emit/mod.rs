@@ -116,7 +116,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use barycentrics::barycentric_gs;
 pub use bitcode::census;
-pub use lower::set_host_max_wave;
+pub use lower::{set_host_max_wave, set_host_min_wave};
 
 static HOST_SHADER_FEATURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(3);
 
@@ -139,7 +139,8 @@ pub fn shader_target_key() -> [u8; 12] {
     let mut key = [0; 12];
     key[..4].copy_from_slice(&lower::host_max_wave().to_le_bytes());
     key[4..8].copy_from_slice(&shader::view_heap_limit().to_le_bytes());
-    key[8..].copy_from_slice(&host_shader_features().to_le_bytes());
+    let features = host_shader_features() | (lower::host_min_wave() << 8);
+    key[8..].copy_from_slice(&features.to_le_bytes());
     key
 }
 pub use mesh_fallback::MeshFallback;

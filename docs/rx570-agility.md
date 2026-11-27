@@ -59,6 +59,20 @@ statically uniform address; the internal driver instructions were not inspected.
 This defect is distinct from missing SM 6.6 support. The dynamic-coordinate
 probe does not prove every translated game atomic shader correct.
 
+## Complete archive translation
+
+The SM 6.6 preparation processed all 26,503 archive records: 25,586 ready,
+303 refused and 614 duplicates. The SM 6.5 result had been 24,907 ready and
+982 refused. All 679 former SM 6.6 image-atomic refusals therefore translate
+with the real device capabilities enabled.
+
+Remaining refusals include 195 records without a supported executable stage,
+40 descriptor-control-flow cases, 40 descriptor-data reads, ten hardware SGPR
+inputs, eight partial interpolations and five float64-to-float32 conversions.
+The remainder concerns a few lane-mask, half-float and permutation operations.
+These are translator gaps; a higher reported Shader Model does not implement
+them. Real PSO creation and game rendering remain separate validation steps.
+
 ## Build and cache
 
 `cargo build --release -p victory --features agility` exports SDK version 620
@@ -72,3 +86,30 @@ The first preparation with the new profile must finish before launching the
 game. Later preparations reuse compatible translations and checkpointed
 pipeline states. Driver cache acceptance is checked before trusting pipeline
 preparation progress.
+
+## Wave32 compute groups on a wave64 GPU
+
+Agility correctly rejects a compute shader declaring `WaveSize(32)` on this
+device, whose minimum and maximum wave size are both 64. Eight selected refused
+game PSOs all had exactly 32 threads per group (`32x1x1` or `8x4x1`). One used
+5,120 bytes of LDS; none contained a group barrier.
+
+For logical wave32 groups containing at most 32 threads on a minimum-wave64
+device, the emitter now declares physical wave64 in metadata and PSV. It keeps
+logical thread relabeling and wave arithmetic unchanged. A physical wave contains
+only that group's active threads, so no second logical wave can contaminate its
+collectives. Groups larger than 32 are excluded from this conversion.
+
+All eight selected PSOs now create with the debug layer: eight ready, zero
+refused. Four independent GPU readback tests cover both group shapes, with and
+without LDS and a group barrier, plus ballots, reductions, prefixes, lane reads
+and divergence. Every expected value matches, with no device removal. The
+metadata boundary tests also verify that larger groups keep their original
+declaration.
+
+A census of 19,106 observed containers found 1,464 native-wave32 compute
+entries in groups of at most 32, and 107 in larger groups. The larger group
+case requires separate subwave emulation: 12 entries use explicit cross-lane
+operations and 67 use read-first-lane. It is not covered by this small-group
+correction, even when a particular PSO creates successfully. The census covers
+observed containers; completeness of recipe references was not asserted.

@@ -186,6 +186,44 @@ fn psv_resource_type(key: BindingKey) -> u32 {
     }
 }
 
+fn physical_wave_size(
+    logical: Option<u32>,
+    threads: Option<[u32; 3]>,
+    minimum: u32,
+) -> Option<u32> {
+    if logical == Some(32)
+        && minimum == 64
+        && threads.is_some_and(|size| (1..=32).contains(&size.iter().product::<u32>()))
+    {
+        Some(64)
+    } else {
+        logical
+    }
+}
+
+#[cfg(test)]
+mod physical_wave_tests {
+    use super::physical_wave_size;
+
+    #[test]
+    fn a_single_small_logical_wave_can_occupy_a_wider_host_wave() {
+        for threads in [[1, 1, 1], [8, 1, 1], [16, 1, 1], [32, 1, 1], [8, 4, 1]] {
+            assert_eq!(physical_wave_size(Some(32), Some(threads), 64), Some(64));
+            assert_eq!(physical_wave_size(Some(32), Some(threads), 32), Some(32));
+        }
+    }
+
+    #[test]
+    fn multiple_logical_waves_are_never_combined_by_metadata() {
+        for threads in [[64, 1, 1], [160, 1, 1], [16, 16, 1]] {
+            assert_eq!(physical_wave_size(Some(32), Some(threads), 64), Some(32));
+        }
+        assert_eq!(physical_wave_size(Some(32), None, 64), Some(32));
+        assert_eq!(physical_wave_size(Some(64), Some([64, 1, 1]), 64), Some(64));
+        assert_eq!(physical_wave_size(None, Some([32, 1, 1]), 64), None);
+    }
+}
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
@@ -747,6 +785,8 @@ impl Shader {
     /// The finished container and the entry-point property tags it
     /// declares (the profile tests read them).
     pub fn finish_with_tags(mut self) -> (Vec<u8>, Vec<u32>) {
+        let physical_wave =
+            physical_wave_size(self.wave_size, self.threads, super::lower::host_min_wave());
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
@@ -1232,7 +1272,7 @@ impl Shader {
                 }
             }
         }
-        if let Some(n) = self.wave_size
+        if let Some(n) = physical_wave
             && self.profile == super::ShaderProfile::Sm66
         {
             property_tags.push(11);
@@ -1345,7 +1385,7 @@ impl Shader {
                 // no wave size is required even when the translation needs
                 // 64-lane waves of the console.
                 wave_size: if self.profile == super::ShaderProfile::Sm66 {
-                    self.wave_size
+                    physical_wave
                 } else {
                     None
                 },

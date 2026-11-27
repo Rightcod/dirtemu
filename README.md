@@ -26,6 +26,7 @@ What is already implemented and tested at shader/PSO level:
 | SM 6.5 shader translation | implemented; the 22 baseline SM 6.6 GPU failures pass on RX 570 |
 | SM 6.5 descriptor tables | implemented; alias-table PSO/dispatch tests pass on RX 570 |
 | Agility / SM 6.6 | optional app-local runtime; real bindless and typed atomic64 GPU tests pass on RX 570; highest reported model is 6.7 |
+| Wave32 compute groups | groups of at most 32 threads run inside physical wave64; 8/8 formerly refused PSOs create with the debug layer |
 | Mesh shader fallback | compute emulation + vertex pulling + one `DrawInstanced`; 9 279 / 9 282 real mesh shaders translate |
 | Amplification shaders | none found in the inspected shader package |
 | BVH / RT profiles | `Full`, `StaticMiss`, `Limited(N)` implemented and tested on RX 570 |
@@ -58,15 +59,20 @@ Latest validation on the RX 570:
 
 Known limitations:
 
-- The previous SM 6.5 shader-archive pass prepared **24,907 translations**
-  and refused 982 records. Of those refusals, 679 require 64-bit image atomics
-  from SM 6.6 and 195 contain an unsupported shader stage. Agility removes
-  the runtime's SM 6.5 ceiling; the complete SM 6.6 pass remains to be measured.
+- The complete SM 6.6 archive pass prepared **25,586 translations**, refused
+  303 records and skipped 614 duplicates out of 26,503 records. All 679 records
+  previously refused for SM 6.6 image atomics now translate. Of the remaining
+  refusals, 195 contain no stage supported by this translator; other gaps include
+  descriptor control flow and descriptor data reads. Translation success does
+  not by itself establish correct execution of every game shader.
 - Driver 31.0.21925.1001 loses conflicting typed atomic updates for literal
   uniform texture coordinates in a synthetic test, including atomic32.
   Dynamic coordinates and explicit wave serialization pass. This is a separate
   correctness issue; an advertised shader model does not establish correctness
   for every shader. See [the capability investigation](docs/rx570-agility.md).
+- Native wave32 compute groups larger than 32 threads still require subwave
+  emulation on Polaris. They are excluded from the small-group wave64 correction;
+  successful PSO creation alone does not verify their cross-lane semantics.
 - The recorded set contains **83,562 pipeline states**. The first full warm
   with the final SM 6.6 translator must finish before the next game run.
   Preparation of every state is not yet a verified result.
