@@ -1611,7 +1611,7 @@ impl<'a> Lower<'a> {
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
             }
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            if console_lanes || (group > 1 && one_wave && s.lds_dwords > 0) {
                 s.wave_size = Some(wave);
             }
         }
@@ -3724,7 +3724,12 @@ impl<'a> Lower<'a> {
         let at = self.s.m.f32(at.to_bits());
         let size = self.unary(6, part);
         let exact = self.s.m.cmp(c, pred::OEQ, size, at);
-        self.s.m.select(c, exact, zero, r)
+        let r = self.s.m.select(c, exact, zero, r);
+        if cosine {
+            r
+        } else {
+            self.s.m.select(c, is_zero, x, r)
+        }
     }
 
     /// The high dword of a 32 × 32-bit product.
