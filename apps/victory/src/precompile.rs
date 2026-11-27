@@ -9,6 +9,7 @@ mod windows {
 
     use crate::{Console, shader};
 
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         cfg: &victory_core::Config,
         exe: &Path,
@@ -82,29 +83,6 @@ mod windows {
             cached: *cached,
             remaining: *remaining,
         })
-    }
-
-    #[cfg(test)]
-    mod report_tests {
-        use super::parse_report;
-
-        #[test]
-        fn worker_results_keep_cached_and_remaining_counts() {
-            let report = parse_report("pipeline result 2000 48 0 1024 80000").unwrap();
-            assert_eq!(
-                (
-                    report.built,
-                    report.refused,
-                    report.unreadable,
-                    report.cached,
-                    report.remaining
-                ),
-                (2000, 48, 0, 1024, 80000)
-            );
-            assert!(parse_report("pipeline result 2000 48 0 1024").is_none());
-            assert!(parse_report("pipeline result 2000 bad 0 1024 0").is_none());
-            assert!(parse_report("shader records 2000/26503 processed").is_none());
-        }
     }
 
     fn prepare_isolated(
@@ -344,6 +322,28 @@ mod windows {
             std::fs::rename(temporary, marker)?;
         }
         Ok(())
+    }
+    #[cfg(test)]
+    mod report_tests {
+        use super::parse_report;
+
+        #[test]
+        fn worker_results_keep_cached_and_remaining_counts() {
+            let report = parse_report("pipeline result 2000 48 0 1024 80000").unwrap();
+            assert_eq!(
+                (
+                    report.built,
+                    report.refused,
+                    report.unreadable,
+                    report.cached,
+                    report.remaining
+                ),
+                (2000, 48, 0, 1024, 80000)
+            );
+            assert!(parse_report("pipeline result 2000 48 0 1024").is_none());
+            assert!(parse_report("pipeline result 2000 bad 0 1024 0").is_none());
+            assert!(parse_report("shader records 2000/26503 processed").is_none());
+        }
     }
 }
 

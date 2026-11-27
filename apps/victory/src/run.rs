@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use crate::{Console, Unimplemented};
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     exe: &Path,
     unimplemented: Unimplemented,
@@ -374,6 +375,7 @@ mod tests {
 }
 
 #[cfg(not(windows))]
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     _: &Path,
     _: Unimplemented,
