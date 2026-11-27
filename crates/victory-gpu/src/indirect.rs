@@ -110,7 +110,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     if (cost > 0) {
         uint before;
         InterlockedOr(budget[0], 0, before);
+#ifndef VICTORY_NO_ALLOW_UAV_CONDITION
         [allow_uav_condition]
+#endif
         while (before < BUDGET) {
             uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
             uint prev;

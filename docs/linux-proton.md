@@ -2,15 +2,15 @@
 
 `dirtemu` builds for Windows on Linux with `cargo-xwin` and runs under
 **Steam Proton** (`vkd3d-proton` for Direct3D 12 and `DXVK` for `DXGI`). Use
-Proton rather than bare system Wine: Proton bundles `vkd3d-proton >= 3.2` and
+Proton rather than bare system Wine: Proton bundles `vkd3d-proton 3.1+` and
 recent `vkd3d-shader`, which avoids SPIR-V pipeline crashes in Mesa RADV and
 compiles the helper compute/graphics shaders without a Windows `d3dcompiler_47.dll`.
 
 ## Requirements
 
-- Steam **Proton Experimental** (or **Proton 11.0+**, providing `vkd3d-proton >= 3.2`).
-  Older Proton/GE-Proton builds can emit invalid SPIR-V and crash RADV during
-  `vkCreateGraphicsPipelines`.
+- Steam **Proton Experimental** / **Proton 10.0+** (or **GE-Proton11+**,
+  providing `vkd3d-proton 3.1+`). Older Proton builds can emit invalid SPIR-V
+  and crash RADV during `vkCreateGraphicsPipelines`.
 - A Vulkan 1.3/1.4 driver:
   - **RDNA 2+** (`RADV`): hardware mesh shaders (`VICTORY_MESH_FALLBACK=auto`)
     and SM 6.6.

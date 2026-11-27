@@ -1097,22 +1097,48 @@ fn plane_pass() -> Option<&'static PlanePass> {
 
 /// Compiles function `entry` of `source` for `target` with the system's
 /// compiler, as the indirect-argument clamp is (`crate::indirect`).
+/// Whether this process runs under Wine/Proton (its `ntdll.dll` exports
+/// `wine_get_version`).
+pub(crate) fn on_wine() -> bool {
+    static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WINE.get_or_init(|| {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: constant NUL-terminated ASCII module and export names.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    })
+}
+
 pub(crate) fn compile(
     source: &str,
     entry: windows::core::PCSTR,
     target: windows::core::PCSTR,
 ) -> windows::core::Result<Vec<u8>> {
+    use windows::Win32::Graphics::Direct3D::D3D_SHADER_MACRO;
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
+    // vkd3d-shader rejects `[allow_uav_condition]`, which Microsoft's FXC uses
+    // on UAV polling loops.
+    let wine_macros = [
+        D3D_SHADER_MACRO {
+            Name: windows::core::s!("VICTORY_NO_ALLOW_UAV_CONDITION"),
+            Definition: windows::core::s!("1"),
+        },
+        D3D_SHADER_MACRO::default(),
+    ];
+    let defines = on_wine().then_some(wine_macros.as_ptr());
+    // SAFETY: the source, names, and optional macro array live through the call;
+    // out pointers are ours.
     let compiled = unsafe {
         D3DCompile(
             source.as_ptr().cast(),
             source.len(),
             windows::core::s!("victory"),
-            None,
+            defines,
             None,
             entry,
             target,

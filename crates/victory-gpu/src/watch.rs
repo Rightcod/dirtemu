@@ -166,20 +166,6 @@ pub(crate) fn once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE").is_none_or(|v| v != "0"))
 }
 
-/// Whether this process runs under Wine/Proton (its `ntdll.dll` exports
-/// `wine_get_version`).
-fn on_wine() -> bool {
-    static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *WINE.get_or_init(|| {
-        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-        // SAFETY: constant NUL-terminated ASCII module and export names.
-        unsafe {
-            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
-            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
-        }
-    })
-}
-
 #[derive(Clone, Copy)]
 struct Region {
     base: usize,
@@ -269,7 +255,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
-    let wine = on_wine();
+    let wine = crate::host::on_wine();
     ask_once_end();
     ask_ahead(ranges);
     let wine_regions: Vec<Option<Region>> = if wine {
@@ -426,7 +412,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let wine = on_wine();
+    let wine = crate::host::on_wine();
     let region = if wine { allocation(start) } else { None };
     let mapped = region.is_some_and(|r| r.mapped && end <= r.last * PAGE);
     let (kfirst, klast) = match region {
