@@ -139,10 +139,13 @@ To warm the cache without starting the game, use the same console profile and
 environment as the launcher.
 
 ```powershell
-.\target\release\victory.exe precompile "<your game folder>\<the game's exe>" --console series-x --jobs 3
+.\target\release\victory.exe precompile "<your game folder>\<the game's exe>" --console series-s --jobs 3
 ```
 
 Add `--used-only` to build only states used in previous runs.
+The RX 570 launcher exposes the Series S console model to the game. Use the
+same console model for preparation and play; recipes recorded as Series X
+belong to a separate set.
 Without that option, every recorded state is attempted. Use the same release
 binary, cache, console profile and shader settings for preparation and play.
 Failure details are stored in `shader-scan/*.failures.txt` in the configured

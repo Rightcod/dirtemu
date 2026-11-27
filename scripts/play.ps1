@@ -4,7 +4,7 @@ param(
     [string]$Cache = "",
     [string]$Data = "",
     [string]$Exe = "$PSScriptRoot\..\target\release\victory.exe",
-    [string]$Console = "series-x"
+    [string]$Console = "series-s"
 )
 $ScriptAuthor = "carunodev"
 $Repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
