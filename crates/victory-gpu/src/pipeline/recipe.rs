@@ -274,6 +274,18 @@ pub(super) fn precompile(
         }
     }
     files.sort_unstable();
+    let available = files.len();
+    match std::env::var("VICTORY_PRECOMPILE_TOTAL") {
+        Ok(value) => {
+            let limit = value.parse::<std::num::NonZeroUsize>().map_err(|_| {
+                anyhow::anyhow!("VICTORY_PRECOMPILE_TOTAL must be a positive integer")
+            })?;
+            files.truncate(limit.get());
+            println!("pipeline selection {} of {available} recipes", files.len());
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(error) => return Err(error.into()),
+    }
     let mut report = Report::default();
     let total = files.len();
     println!("pipeline recipes  {total}");

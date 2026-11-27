@@ -147,6 +147,12 @@ environment as the launcher.
 ```
 
 Add `--used-only` to build only states used in previous runs.
+For a bounded preparation, set `$env:VICTORY_PRECOMPILE_TOTAL = "20000"`
+before running `precompile`. It selects at most the first 20,000 recipes,
+prioritizing previously requested states, then sorting the remaining keys.
+The limit includes checkpointed states and stays in force across workers and
+resumed runs. Ready and refused states are reported separately. Remove the
+variable to prepare the complete set.
 The RX 570 launcher exposes the Series S console model to the game. Use the
 same console model for preparation and play; recipes recorded as Series X
 belong to a separate set.
